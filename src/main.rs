@@ -37,6 +37,11 @@ fn no_l0() -> bool {
     *V.get_or_init(|| std::env::var("NO_L0").map(|v| v == "1").unwrap_or(false))
 }
 
+/// Second-pass relaxed-filter rescue for first-pass failures (--rescue).
+/// Off by default; recovered reads are emitted at MAPQ 0 (flagged uncertain).
+static RESCUE: AtomicBool = AtomicBool::new(false);
+#[inline] fn rescue_pass() -> bool { RESCUE.load(Ordering::Relaxed) }
+
 /// Base-4 encode the reverse-complement of `atom` without allocating.
 #[inline]
 fn encode_revcomp(atom: &[u8]) -> u64 {
@@ -1940,16 +1945,30 @@ fn map_read_with_occ(fwd: &[u8], rc: &[u8], index: &GIndex,
 fn map_read(fwd: &[u8], index: &GIndex, k: usize, s: usize, t: usize, mode: SeedMode,
             max_occ: usize, max_occ_l1: usize) -> Option<MapResult> {
     let rc = revcomp(fwd);
-    let (mut best, second_score) =
-        map_read_with_occ(fwd, &rc, index, k, s, t, mode, max_occ, max_occ_l1);
 
-    if let Some(ref mut b) = best {
-        if b.votes > second_score {
-            b.mapq = (b.votes.saturating_sub(second_score)
-                .saturating_mul(60) / b.votes.max(1)) as u8;
-            b.mapq = b.mapq.min(60);
-            return best;
+    let try_pass = |mo: usize, mo1: usize| -> Option<MapResult> {
+        let (mut best, second_score) =
+            map_read_with_occ(fwd, &rc, index, k, s, t, mode, mo, mo1);
+        if let Some(ref mut b) = best {
+            if b.votes > second_score {
+                b.mapq = (b.votes.saturating_sub(second_score)
+                    .saturating_mul(60) / b.votes.max(1)).min(60) as u8;
+                return best;
+            }
         }
+        None
+    };
+
+    // Pass 1: default thresholds — the fast path for the cleanly-mapped majority.
+    if let Some(r) = try_pass(max_occ, max_occ_l1) { return Some(r); }
+
+    // Pass 2 (--rescue only): reads that fail pass 1 are often in repeat-rich
+    // regions where ~half their true-locus L1/L2 blocks were filtered as too
+    // frequent.  Retry with relaxed thresholds so those blocks survive — gated
+    // strictly to first-pass failures (never disturbs a mapped read).  Recovered
+    // reads come out at MAPQ 0 (flagged uncertain).
+    if rescue_pass() {
+        if let Some(r) = try_pass(max_occ * 4, max_occ_l1 * 4) { return Some(r); }
     }
     None
 }
@@ -2171,6 +2190,9 @@ OPTIONS:
                    BAND = half-band in bp (default auto = max(100, len/50))
   --ref <fa>       reference FASTA for --cigar when mapping against a .idx
   --max-occ N      max genomic occurrences per L2+ block (default 500)
+  --rescue         second relaxed-filter pass for reads that fail the first;
+                   maps a few % more reads in repeat-rich regions, emitted at
+                   MAPQ 0 (flagged uncertain).  Off by default.
 
 Recommended HiFi preset (the default): --k 19 --s 10
 ";
@@ -2194,6 +2216,9 @@ fn main() {
     // (the k-mer atom gives minimap2-level block specificity at HiFi error rates).
     let mode = SeedMode::Syncmer;
     KMER_ATOM.store(true, Ordering::Relaxed);
+    if args.iter().any(|a| a == "--rescue") {
+        RESCUE.store(true, Ordering::Relaxed);
+    }
 
     let k: usize = args.iter().position(|a| a == "--k")
         .and_then(|p| args.get(p + 1)).and_then(|v| v.parse().ok()).unwrap_or(19);

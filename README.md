@@ -104,6 +104,13 @@ syncmer-hifi --map reads.fq.gz genome.idx --ref genome.fa.gz --cigar -o out.paf 
 | `--cigar [BAND]` | off | emit `cg:Z:` CIGAR (needs reference); `BAND` = half-band in bp, auto if omitted |
 | `--ref <fa>` | — | reference FASTA for `--cigar` against a `.idx` |
 | `--max-occ N` | 500 | max genomic occurrences per L2+ block |
+| `--rescue` | off | second relaxed-filter pass for reads that fail the first — recovers a few % more reads in repeat-rich regions, emitted at MAPQ 0 |
+
+`--rescue` runs a second mapping pass (4× looser occurrence filter) **only** on
+reads the default pass leaves unmapped. It never disturbs a confidently-mapped
+read, and everything it recovers is reported at MAPQ 0 so downstream MAPQ
+filtering can treat it as a flagged best-guess. On simulated HiFi it lifts the
+mapping rate ~0.1 pp (≈40 reads / 50 k); use it when you want maximum recall.
 
 You can also map directly against a FASTA (it is indexed in memory first):
 ```sh
