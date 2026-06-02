@@ -1188,7 +1188,14 @@ fn emit_anchors(
     max_occ_l1: usize,
     filter: Option<(u8, i64, i64)>,
     anchors: &mut Vec<Anchor>,
+    visited: &mut std::collections::HashSet<(u8, u32, u64)>,
 ) {
+    // LCP rules intentionally share boundary sub-blocks between adjacent parents.
+    // A shared child is cloned into both parents, so when both fall through to
+    // their children it would otherwise be visited (and its mass emitted) TWICE.
+    // Deduplicate by block identity (level, query-pos, hash) → emit once.
+    if !visited.insert((block.level as u8, block.pos, block.hash)) { return; }
+
     // block.level is now 0-indexed: 0 = L0 raw syncmer, 1 = L1 block, …
     let mocc = max_occ_for_level(block.level, max_occ, max_occ_l1);
     let hits = index.lookup(block.level, block.hash, mocc);
@@ -1217,7 +1224,7 @@ fn emit_anchors(
     }
     // Block not found or too repetitive — try finer-grained children.
     for child in &block.children {
-        emit_anchors(child, index, max_occ, max_occ_l1, filter, anchors);
+        emit_anchors(child, index, max_occ, max_occ_l1, filter, anchors, visited);
     }
 }
 
@@ -1251,8 +1258,9 @@ fn collect_anchors(
     };
     let hier = extract_hier_blocks_n(seq, k, s, t, index.num_levels(), mode);
     let mut anchors = Vec::new();
+    let mut visited: std::collections::HashSet<(u8, u32, u64)> = std::collections::HashSet::new();
     for block in &hier {
-        emit_anchors(block, index, max_occ, max_occ_l1, filter, &mut anchors);
+        emit_anchors(block, index, max_occ, max_occ_l1, filter, &mut anchors, &mut visited);
     }
 
     // ── L0 fallback pass ─────────────────────────────────────────────────────
