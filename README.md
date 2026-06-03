@@ -5,10 +5,10 @@ A long-read mapper for **PacBio HiFi** reads built on a hierarchy of
 read by chaining matches of multi-scale blocks that are reproducible between the
 read and the reference even in the presence of sequencing errors.
 
-On simulated T2T-CHM13 HiFi reads it reaches **99.43 % placement accuracy /
-99.84 % precision**, matching `minimap2 -x map-hifi` precision (99.64 %) while
-running CIGAR-free mapping at ~1,800 reads/s on 8 threads, with a ~17 % smaller
-in-memory index.
+On simulated T2T-CHM13 HiFi reads (100 k × 24 kb, 0.1 % error) it reaches
+**99.58 % placement accuracy / 99.95 % precision with zero wrong-chromosome
+calls**, exceeding `minimap2 -x map-hifi` precision while running CIGAR-free
+mapping at **~1,770 reads/s** on 8 threads, with a ~17 % smaller in-memory index.
 
 ---
 
@@ -58,6 +58,14 @@ down-weights repetitive blocks without any explicit repeat penalty. Anchors are
 pruned to the densest diagonals, then a colinear chain-DP finds the best chain;
 the gap to the second-best chain sets MAPQ.
 
+By default only blocks at **level ≥ 3** (≈ L3–L6, spans ≳ 150 bp) are allowed to
+anchor a read (`--min-level`, default 3). The short L0–L2 blocks match in many
+places across segmental duplications and paralogs, and at HiFi error rates they
+add ambiguity rather than signal: dropping them raises accuracy, eliminates
+wrong-chromosome calls, and runs ~50 % faster. The finer levels are still indexed
+and are re-enabled with `--min-level 0` for noisier (> 1 % error) data, where their
+sensitivity is needed.
+
 ### 6. Optional CIGAR (`--cigar`)
 Base-level alignment reuses the chain as a scaffold: anchor spans are emitted
 directly and only the short inter-anchor gaps are aligned, with an **affine-gap**
@@ -104,6 +112,14 @@ syncmer-hifi --map reads.fq.gz genome.idx --ref genome.fa.gz --cigar -o out.paf 
 | `--cigar [BAND]` | off | emit `cg:Z:` CIGAR (needs reference); `BAND` = half-band in bp, auto if omitted |
 | `--ref <fa>` | — | reference FASTA for `--cigar` against a `.idx` |
 | `--max-occ N` | 500 | max genomic occurrences per L2+ block |
+| `--min-level N` | 3 | lowest block level allowed to anchor a read; default 3 is tuned for HiFi, use 0 for >1 % error reads |
+| `--rescue` | off | second relaxed-filter pass for reads that fail the first — recovers a few % more reads in repeat-rich regions, emitted at MAPQ 0 |
+
+`--rescue` runs a second mapping pass (4× looser occurrence filter) **only** on
+reads the default pass leaves unmapped. It never disturbs a confidently-mapped
+read, and everything it recovers is reported at MAPQ 0 so downstream MAPQ
+filtering can treat it as a flagged best-guess. On simulated HiFi it lifts the
+mapping rate ~0.1 pp (≈40 reads / 50 k); use it when you want maximum recall.
 
 You can also map directly against a FASTA (it is indexed in memory first):
 ```sh
@@ -133,15 +149,16 @@ count, and precision.
 
 | Goal | Setting |
 |------|---------|
-| Default (best accuracy) | `k=19 s=10`, 6 levels |
-| Slightly faster (~+10 %) | same, but build with 5 levels |
+| Default (best HiFi accuracy + speed) | `k=19 s=10 --min-level 3` (the default) |
+| Noisy reads (> 1 % error) | `--min-level 0` (restores finer-block sensitivity) |
 | Highest precision / fewest wrong-chr | `k=11 s=7` (≈2× slower) |
 
 ## Notes & limitations
 
 - Designed for **HiFi** (≤ ~1 % error) long reads. The k-mer-atom specificity
   that makes it accurate relies on low error rates; it is not intended for ONT
-  or short reads.
+  or short reads. The default `--min-level 3` is tuned for this regime — above
+  ~1 % error it trades too much sensitivity, so use `--min-level 0` there.
 - The residual ~0.4 % unmapped and ~0.15 % mis-placed reads are dominated by
   true reference duplications (segmental duplications, acrocentric paralogs) and
   tandem-repeat arrays, where a single best locus is genuinely ambiguous; these

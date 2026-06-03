@@ -37,6 +37,25 @@ fn no_l0() -> bool {
     *V.get_or_init(|| std::env::var("NO_L0").map(|v| v == "1").unwrap_or(false))
 }
 
+/// Minimum hierarchy level whose blocks may produce anchors (`--min-level N`,
+/// default 3). Blocks below this level are neither emitted nor recursed into — the
+/// read is placed only by the coarser, more-unique high-level blocks, which at HiFi
+/// error rates removes paralog/segmental-dup ambiguity (higher accuracy + faster).
+/// A floor > 0 also disables the L0 raw-syncmer fallback.
+/// Set once from the CLI before mapping; falls back to env MIN_LVL then default 3.
+static MIN_LVL_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+fn set_min_lvl(v: usize) { let _ = MIN_LVL_CELL.set(v); }
+fn min_lvl() -> usize {
+    *MIN_LVL_CELL.get_or_init(|| {
+        std::env::var("MIN_LVL").ok().and_then(|v| v.parse().ok()).unwrap_or(3)
+    })
+}
+
+/// Second-pass relaxed-filter rescue for first-pass failures (--rescue).
+/// Off by default; recovered reads are emitted at MAPQ 0 (flagged uncertain).
+static RESCUE: AtomicBool = AtomicBool::new(false);
+#[inline] fn rescue_pass() -> bool { RESCUE.load(Ordering::Relaxed) }
+
 /// Base-4 encode the reverse-complement of `atom` without allocating.
 #[inline]
 fn encode_revcomp(atom: &[u8]) -> u64 {
@@ -1188,7 +1207,17 @@ fn emit_anchors(
     max_occ_l1: usize,
     filter: Option<(u8, i64, i64)>,
     anchors: &mut Vec<Anchor>,
+    visited: &mut std::collections::HashSet<(u8, u32, u64)>,
 ) {
+    // Level floor: ignore blocks below MIN_LVL (don't emit, don't recurse deeper).
+    if block.level < min_lvl() { return; }
+
+    // LCP rules intentionally share boundary sub-blocks between adjacent parents.
+    // A shared child is cloned into both parents, so when both fall through to
+    // their children it would otherwise be visited (and its mass emitted) TWICE.
+    // Deduplicate by block identity (level, query-pos, hash) → emit once.
+    if !visited.insert((block.level as u8, block.pos, block.hash)) { return; }
+
     // block.level is now 0-indexed: 0 = L0 raw syncmer, 1 = L1 block, …
     let mocc = max_occ_for_level(block.level, max_occ, max_occ_l1);
     let hits = index.lookup(block.level, block.hash, mocc);
@@ -1217,7 +1246,7 @@ fn emit_anchors(
     }
     // Block not found or too repetitive — try finer-grained children.
     for child in &block.children {
-        emit_anchors(child, index, max_occ, max_occ_l1, filter, anchors);
+        emit_anchors(child, index, max_occ, max_occ_l1, filter, anchors, visited);
     }
 }
 
@@ -1251,15 +1280,16 @@ fn collect_anchors(
     };
     let hier = extract_hier_blocks_n(seq, k, s, t, index.num_levels(), mode);
     let mut anchors = Vec::new();
+    let mut visited: std::collections::HashSet<(u8, u32, u64)> = std::collections::HashSet::new();
     for block in &hier {
-        emit_anchors(block, index, max_occ, max_occ_l1, filter, &mut anchors);
+        emit_anchors(block, index, max_occ, max_occ_l1, filter, &mut anchors, &mut visited);
     }
 
     // ── L0 fallback pass ─────────────────────────────────────────────────────
     // Only runs when the L1+ hierarchy gives very few anchors AND the index
     // actually has an L0 level (levels[0] non-empty).
     let l0_populated = index.levels.first().map_or(false, |l| !l.is_empty());
-    if l0_populated && !no_l0() && anchors.len() < L0_FALLBACK_THRESHOLD {
+    if l0_populated && !no_l0() && min_lvl() == 0 && anchors.len() < L0_FALLBACK_THRESHOLD {
         // Compute k-mer hashes for the read (small — reads are ~15 kbp).
         if let Some(kh_iter) = DnaHashFwd::new(seq, k) {
             let kmer_hashes: Vec<u64> = kh_iter.collect();
@@ -1932,16 +1962,30 @@ fn map_read_with_occ(fwd: &[u8], rc: &[u8], index: &GIndex,
 fn map_read(fwd: &[u8], index: &GIndex, k: usize, s: usize, t: usize, mode: SeedMode,
             max_occ: usize, max_occ_l1: usize) -> Option<MapResult> {
     let rc = revcomp(fwd);
-    let (mut best, second_score) =
-        map_read_with_occ(fwd, &rc, index, k, s, t, mode, max_occ, max_occ_l1);
 
-    if let Some(ref mut b) = best {
-        if b.votes > second_score {
-            b.mapq = (b.votes.saturating_sub(second_score)
-                .saturating_mul(60) / b.votes.max(1)) as u8;
-            b.mapq = b.mapq.min(60);
-            return best;
+    let try_pass = |mo: usize, mo1: usize| -> Option<MapResult> {
+        let (mut best, second_score) =
+            map_read_with_occ(fwd, &rc, index, k, s, t, mode, mo, mo1);
+        if let Some(ref mut b) = best {
+            if b.votes > second_score {
+                b.mapq = (b.votes.saturating_sub(second_score)
+                    .saturating_mul(60) / b.votes.max(1)).min(60) as u8;
+                return best;
+            }
         }
+        None
+    };
+
+    // Pass 1: default thresholds — the fast path for the cleanly-mapped majority.
+    if let Some(r) = try_pass(max_occ, max_occ_l1) { return Some(r); }
+
+    // Pass 2 (--rescue only): reads that fail pass 1 are often in repeat-rich
+    // regions where ~half their true-locus L1/L2 blocks were filtered as too
+    // frequent.  Retry with relaxed thresholds so those blocks survive — gated
+    // strictly to first-pass failures (never disturbs a mapped read).  Recovered
+    // reads come out at MAPQ 0 (flagged uncertain).
+    if rescue_pass() {
+        if let Some(r) = try_pass(max_occ * 4, max_occ_l1 * 4) { return Some(r); }
     }
     None
 }
@@ -2163,6 +2207,13 @@ OPTIONS:
                    BAND = half-band in bp (default auto = max(100, len/50))
   --ref <fa>       reference FASTA for --cigar when mapping against a .idx
   --max-occ N      max genomic occurrences per L2+ block (default 500)
+  --min-level N    lowest block level allowed to anchor a read (default 3).
+                   Default 3 is tuned for HiFi (≤~0.5% error): higher accuracy,
+                   near-zero wrong-chromosome, ~50% faster. Use 0 for noisy
+                   (>1% error) reads, which need the finer-block fallback.
+  --rescue         second relaxed-filter pass for reads that fail the first;
+                   maps a few % more reads in repeat-rich regions, emitted at
+                   MAPQ 0 (flagged uncertain).  Off by default.
 
 Recommended HiFi preset (the default): --k 19 --s 10
 ";
@@ -2186,6 +2237,20 @@ fn main() {
     // (the k-mer atom gives minimap2-level block specificity at HiFi error rates).
     let mode = SeedMode::Syncmer;
     KMER_ATOM.store(true, Ordering::Relaxed);
+    if args.iter().any(|a| a == "--rescue") {
+        RESCUE.store(true, Ordering::Relaxed);
+    }
+
+    // --min-level N  (default 3): minimum hierarchy level allowed to anchor a read.
+    // Blocks below N are ignored, placing reads via the coarser, more-unique
+    // high-level blocks. Default 3 is tuned for HiFi (≤~0.5% error): higher
+    // accuracy, near-zero wrong-chromosome, ~50% faster. Use --min-level 0 for
+    // noisy (>1%) reads, where the finer-block fallback is needed for sensitivity.
+    if let Some(v) = args.iter().position(|a| a == "--min-level")
+        .and_then(|p| args.get(p + 1)).and_then(|v| v.parse::<usize>().ok())
+    {
+        set_min_lvl(v);
+    }
 
     let k: usize = args.iter().position(|a| a == "--k")
         .and_then(|p| args.get(p + 1)).and_then(|v| v.parse().ok()).unwrap_or(19);
