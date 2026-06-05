@@ -17,6 +17,37 @@ use std::collections::HashSet;
 use flate2::read::MultiGzDecoder;
 use rayon::prelude::*;
 
+// ── Per-stage profiling (env PROFILE=1) ─────────────────────────────────────
+// Each counter accumulates wall-nanoseconds summed across all worker threads.
+// Zero overhead when PROFILE is unset (the Instant calls are skipped).
+use std::sync::atomic::AtomicU64;
+pub(crate) static PROF_RC:     AtomicU64 = AtomicU64::new(0); // reverse-complement
+pub(crate) static PROF_HIER:   AtomicU64 = AtomicU64::new(0); // syncmers+LCP+hierarchy (total)
+pub(crate) static PROF_SEED:   AtomicU64 = AtomicU64::new(0); //   ├ syncmer selection+hashing
+pub(crate) static PROF_L1:     AtomicU64 = AtomicU64::new(0); //   ├ L1 parse + block build
+pub(crate) static PROF_UPPER:  AtomicU64 = AtomicU64::new(0); //   └ L2..L6 recursion
+pub(crate) static PROF_EMIT:   AtomicU64 = AtomicU64::new(0); // index lookups / anchors
+pub(crate) static PROF_PRUNE:  AtomicU64 = AtomicU64::new(0); // anchor pruning
+pub(crate) static PROF_SELECT: AtomicU64 = AtomicU64::new(0); // voting / chain-DP
+
+#[inline]
+pub(crate) fn profiling() -> bool {
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| std::env::var("PROFILE").map(|v| v == "1").unwrap_or(false))
+}
+/// Run `f`, and if profiling is on add its elapsed time to `ctr`. Returns f's value.
+#[inline]
+pub(crate) fn timed<T>(ctr: &AtomicU64, f: impl FnOnce() -> T) -> T {
+    if profiling() {
+        let t = Instant::now();
+        let r = f();
+        ctr.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        r
+    } else {
+        f()
+    }
+}
+
 /// Hierarchy-atom selector.  When true, LCP uses the full k-mer as each leaf
 /// value (high specificity, best for low-error HiFi).  When false (default),
 /// it uses the middle s-mer (more error-tolerant, best for ONT).
