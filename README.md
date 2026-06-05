@@ -2,20 +2,22 @@
 
 A long-read mapper for **PacBio HiFi** reads built on a hierarchy of
 **locally-consistent syncmer blocks**. Instead of seed-and-extend, it places a
-read by chaining matches of multi-scale blocks that are reproducible between the
+read by voting matches of multi-scale blocks that are reproducible between the
 read and the reference even in the presence of sequencing errors.
 
 On simulated T2T-CHM13 HiFi reads (100 k × 24 kb, 0.1 % error) it reaches
-**99.58 % placement accuracy / 99.95 % precision with zero wrong-chromosome
+**99.59 % placement accuracy / 99.97 % precision with zero wrong-chromosome
 calls**, exceeding `minimap2 -x map-hifi` precision while running CIGAR-free
-mapping at **~1,770 reads/s** on 8 threads, with a ~17 % smaller in-memory index.
+mapping at **~1,900 reads/s** on 8 threads. Because the default index stores only
+the coarse blocks it actually uses (levels ≥ 3), the T2T-CHM13 index is just
+**~560 MB** — roughly an order of magnitude smaller than the full hierarchy.
 
 ---
 
 ## How it works
 
 The method turns each sequence into a **multi-level hierarchy of blocks** and
-maps by chaining block matches. Six steps:
+maps by voting on block matches. Six steps:
 
 ### 1. Seeds — open syncmers
 A k-mer (default `k = 19`) is selected as a *syncmer* iff the minimum-hash
@@ -49,22 +51,26 @@ cache-friendly binary search). The **atom** fed into the hierarchy is the full
 k-mer (not the s-mer) — at HiFi error rates this is rarely corrupted and gives
 ~97.5 % genome-unique L1 blocks, the key to minimap2-level specificity.
 
-### 5. Anchoring + chaining
+### 5. Anchoring + voting
 For each read, blocks are looked up; over-frequent blocks are skipped and finer
 children tried. Each anchor’s weight is its **conservation-of-mass** score:
 every syncmer carries mass 1, a block’s mass is the sum of its units’ masses, and
 a unit shared by *m* blocks contributes 1/m to each. This automatically
-down-weights repetitive blocks without any explicit repeat penalty. Anchors are
-pruned to the densest diagonals, then a colinear chain-DP finds the best chain;
-the gap to the second-best chain sets MAPQ.
+down-weights repetitive blocks without any explicit repeat penalty.
 
-By default only blocks at **level ≥ 3** (≈ L3–L6, spans ≳ 150 bp) are allowed to
-anchor a read (`--min-level`, default 3). The short L0–L2 blocks match in many
-places across segmental duplications and paralogs, and at HiFi error rates they
-add ambiguity rather than signal: dropping them raises accuracy, eliminates
-wrong-chromosome calls, and runs ~50 % faster. The finer levels are still indexed
-and are re-enabled with `--min-level 0` for noisier (> 1 % error) data, where their
-sensitivity is needed.
+The read’s locus is then chosen by **diagonal voting** (default): anchors are
+binned by diagonal (`r_pos − q_pos`) and the heaviest cluster wins, with the gap
+to the next-best locus setting MAPQ. Voting is slightly more accurate than a
+colinear chain-DP on contested (paralogous) reads and just as fast; pass
+`--chaining` to use the gap-penalised chain-DP instead.
+
+By default only blocks at **level ≥ 3** (≈ L3–L6, spans ≳ 150 bp) are indexed and
+allowed to anchor a read (`--min-level`, default 3). The short L0–L2 blocks match
+in many places across segmental duplications and paralogs, and at HiFi error rates
+they add ambiguity rather than signal: dropping them raises accuracy, eliminates
+wrong-chromosome calls, runs ~50 % faster, and shrinks the index ~10×. Build with
+`--index-min-level 0` and map with `--min-level 0` for noisier (> 1 % error) data,
+where the finer levels’ sensitivity is needed.
 
 ### 6. Optional CIGAR (`--cigar`)
 Base-level alignment reuses the chain as a scaffold: anchor spans are emitted
@@ -89,8 +95,11 @@ cargo build --release
 ```sh
 syncmer-hifi --build-index genome.fa.gz genome.idx --threads 8
 ```
-Default preset is `k=19 s=10`. The index records its parameters, so mapping
-needs no flags.
+Default preset is `k=19 s=10`, indexing only the coarse blocks the default mapper
+uses (levels ≥ 3) — the T2T-CHM13 index is ~560 MB and builds in well under a
+minute. The index records its parameters, so mapping needs no flags. To also
+support mapping noisy (> 1 % error) reads at `--min-level 0`, build the full
+hierarchy with `--index-min-level 0`.
 
 ### 2. Map HiFi reads → PAF
 ```sh
@@ -113,6 +122,9 @@ syncmer-hifi --map reads.fq.gz genome.idx --ref genome.fa.gz --cigar -o out.paf 
 | `--ref <fa>` | — | reference FASTA for `--cigar` against a `.idx` |
 | `--max-occ N` | 500 | max genomic occurrences per L2+ block |
 | `--min-level N` | 3 | lowest block level allowed to anchor a read; default 3 is tuned for HiFi, use 0 for >1 % error reads |
+| `--index-min-level N` | 3 | *(build only)* lowest block level to index; match `--min-level`. Use 0 to support `--min-level 0` mapping |
+| `--vote` | on | place reads by diagonal voting (default selector) |
+| `--chaining` | off | place reads by colinear chain-DP instead of voting |
 | `--rescue` | off | second relaxed-filter pass for reads that fail the first — recovers a few % more reads in repeat-rich regions, emitted at MAPQ 0 |
 
 `--rescue` runs a second mapping pass (4× looser occurrence filter) **only** on
@@ -150,8 +162,25 @@ count, and precision.
 | Goal | Setting |
 |------|---------|
 | Default (best HiFi accuracy + speed) | `k=19 s=10 --min-level 3` (the default) |
-| Noisy reads (> 1 % error) | `--min-level 0` (restores finer-block sensitivity) |
+| Noisy reads (> 1 % error) | build `--index-min-level 0`, map `--min-level 0` |
 | Highest precision / fewest wrong-chr | `k=11 s=7` (≈2× slower) |
+
+## Source layout
+
+The crate is split into one module per pipeline stage:
+
+| Module | Responsibility |
+|--------|----------------|
+| `config.rs` | runtime flags (`--min-level`, `--vote`/`--chaining`, `--rescue`, …) and shared helpers |
+| `hash.rs` | rolling DNA hash, atom encoding, per-level block hashing |
+| `syncmer.rs` | open-syncmer selection, `SeedMode` |
+| `lcp.rs` | locally-consistent parsing → `Block`/`HierBlock` hierarchy |
+| `index.rs` | `GIndex` build / serialise / load (levels ≥ `--index-min-level`) |
+| `fastq.rs` | FASTQ reader, reverse-complement |
+| `align.rs` | banded affine-gap alignment and chain-guided CIGAR |
+| `chain.rs` | anchor collection, diagonal voting, chain-DP |
+| `map.rs` | per-read mapping, MAPQ, PAF output, the mapping driver |
+| `main.rs` | CLI parsing and entry point |
 
 ## Notes & limitations
 
