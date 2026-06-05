@@ -242,36 +242,45 @@ pub(crate) fn extract_all_levels(seq: &[u8], k: usize, s: usize, t: usize, max_l
     all
 }
 
-/// A block at any hierarchy level, with its children at level-1.
-/// level is 1-indexed: 1 = L1 (leaf), 2 = L2, …
-/// Children are empty for L1 leaves.
+/// A block at any hierarchy level. `level` is 1-indexed: 1 = L1 (leaf), 2 = L2, …
 /// `pos`..`end` is the half-open query interval covered by this block (in bp).
-#[derive(Clone)]
-pub(crate) struct HierBlock {
+///
+/// `children` holds **indices into the level below** (`forest.levels[level-1]`),
+/// not owned subtrees — LCP shares boundary sub-blocks between adjacent parents,
+/// so an owned-children tree had to deep-clone shared subtrees at every level
+/// (~32 % of map time). Index references store each block exactly once.
+pub(crate) struct HierNode {
     pub(crate) level:    usize,
     pub(crate) hash:     u64,
     pub(crate) pos:      u32,   // query start (inclusive)
     pub(crate) end:      u32,   // query end   (exclusive); span = end - pos
-    #[allow(dead_code)]
-    pub(crate) rule:     &'static str,  // LCP rule that formed this block (provenance)
     /// Conservation-of-mass weight: every syncmer carries mass 1; a block's mass
     /// is the sum of its units' masses, with a unit shared by `m` blocks
     /// contributing 1/m to each.  Total mass is conserved across all levels.
     pub(crate) mass:     f32,
-    pub(crate) children: Vec<HierBlock>,
+    pub(crate) children: Vec<u32>,  // indices into the level below
 }
 
-/// Build the recursive HierBlock tree for one read strand.
-/// Returns top-level blocks (highest level reachable from this read).
+/// The full per-read block hierarchy, stored flat: `levels[L]` is every block at
+/// level L (1-indexed; `levels[0]` is an unused placeholder). The top-level blocks
+/// to anchor from are `levels[top_level]`.
+pub(crate) struct HierForest {
+    pub(crate) levels:    Vec<Vec<HierNode>>,
+    pub(crate) top_level: usize,
+}
+
+/// Build the per-read block hierarchy as a flat `HierForest`.
 /// num_levels is taken from the loaded index so we don't exceed what was indexed.
 pub(crate) fn extract_hier_blocks_n(seq: &[u8], k: usize, s: usize, t: usize, num_levels: usize,
-                         mode: SeedMode) -> Vec<HierBlock>
+                         mode: SeedMode) -> HierForest
 {
-    let syncmers = select_seeds_light(seq, k, s, t, mode);
-    if syncmers.is_empty() { return vec![]; }
+    let empty = || HierForest { levels: vec![Vec::new()], top_level: 0 };
+
+    let syncmers = timed(&PROF_SEED, || select_seeds_light(seq, k, s, t, mode));
+    if syncmers.is_empty() { return empty(); }
 
     let smer_vals: Vec<u64> = syncmers.iter().map(|sm| sm.value).collect();
-    let l1_raw = locally_consistent_parsing(&smer_vals);
+    let l1_raw = timed(&PROF_L1, || locally_consistent_parsing(&smer_vals));
 
     // ── L1 masses ────────────────────────────────────────────────────────────
     // Each syncmer carries mass 1.  A syncmer shared by `m` L1 blocks splits its
@@ -279,51 +288,59 @@ pub(crate) fn extract_hier_blocks_n(seq: &[u8], k: usize, s: usize, t: usize, nu
     let mut sync_membership = vec![0u32; syncmers.len()];
     for blk in &l1_raw { for &i in &blk.indices { sync_membership[i] += 1; } }
 
-    let mut cur_blocks: Vec<HierBlock> = l1_raw.iter().map(|blk| {
+    let l1: Vec<HierNode> = l1_raw.iter().map(|blk| {
         let bvals: Vec<u64> = blk.indices.iter().map(|&i| smer_vals[i]).collect();
         let h   = block_hash_for_level(&bvals, 0);
         let pos = syncmers[blk.indices[0]].pos;
         let end = syncmers[*blk.indices.last().unwrap()].pos + k as u32;
         let mass: f32 = blk.indices.iter()
             .map(|&i| 1.0 / sync_membership[i] as f32).sum();
-        HierBlock { level: 1, hash: h, pos, end, rule: blk.rule,
-                    mass, children: vec![] }
+        HierNode { level: 1, hash: h, pos, end, mass, children: Vec::new() }
     }).collect();
 
-    if cur_blocks.is_empty() { return vec![]; }
+    if l1.is_empty() { return empty(); }
 
-    // Iteratively build L2, L3, … up to num_levels
-    for level_1idx in 2..=num_levels {
-        if cur_blocks.len() < 2 { break; }
+    // levels[0] is an unused placeholder so level numbers index directly.
+    let mut levels: Vec<Vec<HierNode>> = vec![Vec::new(), l1];
+    let mut top_level = 1usize;
 
-        // Snapshot hashes+positions+ends+masses before moving ownership
-        let cur_hashes: Vec<u64> = cur_blocks.iter().map(|b| b.hash).collect();
-        let cur_pos:    Vec<u32> = cur_blocks.iter().map(|b| b.pos).collect();
-        let cur_end:    Vec<u32> = cur_blocks.iter().map(|b| b.end).collect();
-        let cur_mass:   Vec<f32> = cur_blocks.iter().map(|b| b.mass).collect();
-        let next_raw = locally_consistent_parsing(&cur_hashes);
-        if next_raw.is_empty() { break; }
+    // Iteratively build L2, L3, … up to num_levels. Each new node stores its
+    // children as indices into the level below — no subtree cloning.
+    timed(&PROF_UPPER, || {
+        for level_1idx in 2..=num_levels {
+            let cur = &levels[level_1idx - 1];
+            if cur.len() < 2 { break; }
 
-        // Membership: how many parent blocks each child block belongs to.
-        let mut child_membership = vec![0u32; cur_blocks.len()];
-        for blk in &next_raw { for &i in &blk.indices { child_membership[i] += 1; } }
+            // Snapshot the fields we need so we can push to `levels` afterwards.
+            let cur_hashes: Vec<u64> = cur.iter().map(|b| b.hash).collect();
+            let cur_pos:    Vec<u32> = cur.iter().map(|b| b.pos).collect();
+            let cur_end:    Vec<u32> = cur.iter().map(|b| b.end).collect();
+            let cur_mass:   Vec<f32> = cur.iter().map(|b| b.mass).collect();
+            let next_raw = locally_consistent_parsing(&cur_hashes);
+            if next_raw.is_empty() { break; }
 
-        let prev_blocks = std::mem::take(&mut cur_blocks);
-        cur_blocks = next_raw.iter().map(|blk| {
-            let bvals: Vec<u64> = blk.indices.iter().map(|&i| cur_hashes[i]).collect();
-            let h        = block_hash_for_level(&bvals, level_1idx - 1);
-            let pos      = cur_pos[blk.indices[0]];
-            let end      = cur_end[*blk.indices.last().unwrap()];
-            // Parent mass = sum of each child's mass / (#parents sharing that child).
-            let mass: f32 = blk.indices.iter()
-                .map(|&i| cur_mass[i] / child_membership[i] as f32).sum();
-            let children = blk.indices.iter().map(|&i| prev_blocks[i].clone()).collect();
-            HierBlock { level: level_1idx, hash: h, pos, end, rule: blk.rule,
-                        mass, children }
-        }).collect();
-    }
+            // Membership: how many parent blocks each child block belongs to.
+            let mut child_membership = vec![0u32; cur_hashes.len()];
+            for blk in &next_raw { for &i in &blk.indices { child_membership[i] += 1; } }
 
-    cur_blocks  // top-level blocks for this read
+            let new_level: Vec<HierNode> = next_raw.iter().map(|blk| {
+                let bvals: Vec<u64> = blk.indices.iter().map(|&i| cur_hashes[i]).collect();
+                let h        = block_hash_for_level(&bvals, level_1idx - 1);
+                let pos      = cur_pos[blk.indices[0]];
+                let end      = cur_end[*blk.indices.last().unwrap()];
+                // Parent mass = sum of each child's mass / (#parents sharing that child).
+                let mass: f32 = blk.indices.iter()
+                    .map(|&i| cur_mass[i] / child_membership[i] as f32).sum();
+                let children: Vec<u32> = blk.indices.iter().map(|&i| i as u32).collect();
+                HierNode { level: level_1idx, hash: h, pos, end, mass, children }
+            }).collect();
+
+            levels.push(new_level);
+            top_level = level_1idx;
+        }
+    });
+
+    HierForest { levels, top_level }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

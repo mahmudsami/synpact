@@ -8,7 +8,7 @@ read and the reference even in the presence of sequencing errors.
 On simulated T2T-CHM13 HiFi reads (100 k × 24 kb, 0.1 % error) it reaches
 **99.59 % placement accuracy / 99.97 % precision with zero wrong-chromosome
 calls**, exceeding `minimap2 -x map-hifi` precision while running CIGAR-free
-mapping at **~1,900 reads/s** on 8 threads. Because the default index stores only
+mapping at **~2,400 reads/s** on 8 threads. Because the default index stores only
 the coarse blocks it actually uses (levels ≥ 3), the T2T-CHM13 index is just
 **~560 MB** — roughly an order of magnitude smaller than the full hierarchy.
 

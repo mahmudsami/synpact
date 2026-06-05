@@ -37,7 +37,9 @@ pub(crate) struct Anchor {
 /// Tries the block's own level first (highest weight); falls back to children.
 /// `filter` is (chr, lo, hi) in reference-start-offset coords (r_pos - q_pos).
 pub(crate) fn emit_anchors(
-    block: &HierBlock,
+    forest: &HierForest,
+    level: usize,
+    idx: usize,
     index: &GIndex,
     max_occ: usize,
     max_occ_l1: usize,
@@ -46,12 +48,14 @@ pub(crate) fn emit_anchors(
     visited: &mut std::collections::HashSet<(u8, u32, u64)>,
 ) {
     // Level floor: ignore blocks below MIN_LVL (don't emit, don't recurse deeper).
-    if block.level < min_lvl() { return; }
+    if level < min_lvl() { return; }
 
-    // LCP rules intentionally share boundary sub-blocks between adjacent parents.
-    // A shared child is cloned into both parents, so when both fall through to
-    // their children it would otherwise be visited (and its mass emitted) TWICE.
-    // Deduplicate by block identity (level, query-pos, hash) → emit once.
+    let block = &forest.levels[level][idx];
+
+    // LCP rules intentionally share boundary sub-blocks between adjacent parents,
+    // so a shared child is reachable from two parents that both fell through to
+    // their children. Deduplicate by block identity (level, query-pos, hash) so
+    // its mass is emitted exactly once.
     if !visited.insert((block.level as u8, block.pos, block.hash)) { return; }
 
     // block.level is now 0-indexed: 0 = L0 raw syncmer, 1 = L1 block, …
@@ -80,9 +84,12 @@ pub(crate) fn emit_anchors(
         }
         return;
     }
-    // Block not found or too repetitive — try finer-grained children.
-    for child in &block.children {
-        emit_anchors(child, index, max_occ, max_occ_l1, filter, anchors, visited);
+    // Block not found or too repetitive — try finer-grained children (level-1).
+    // `forest` is only ever shared-borrowed, so the recursion needs no clone.
+    for ci in 0..block.children.len() {
+        let c = forest.levels[level][idx].children[ci] as usize;
+        emit_anchors(forest, level - 1, c, index,
+                     max_occ, max_occ_l1, filter, anchors, visited);
     }
 }
 
@@ -111,12 +118,18 @@ pub(crate) fn collect_anchors(
         (Some(c), Some(lo), Some(hi)) => Some((c, lo, hi)),
         _ => None,
     };
-    let hier = extract_hier_blocks_n(seq, k, s, t, index.num_levels(), mode);
+    let forest = timed(&PROF_HIER, || extract_hier_blocks_n(seq, k, s, t, index.num_levels(), mode));
     let mut anchors = Vec::new();
     let mut visited: std::collections::HashSet<(u8, u32, u64)> = std::collections::HashSet::new();
-    for block in &hier {
-        emit_anchors(block, index, max_occ, max_occ_l1, filter, &mut anchors, &mut visited);
-    }
+    timed(&PROF_EMIT, || {
+        let tl = forest.top_level;
+        if tl >= 1 {
+            for idx in 0..forest.levels[tl].len() {
+                emit_anchors(&forest, tl, idx, index, max_occ, max_occ_l1,
+                             filter, &mut anchors, &mut visited);
+            }
+        }
+    });
 
     // ── L0 fallback pass ─────────────────────────────────────────────────────
     // Only runs when the L1+ hierarchy gives very few anchors AND the index
@@ -150,7 +163,7 @@ pub(crate) fn collect_anchors(
         }
     }
 
-    prune_anchors(&mut anchors);
+    timed(&PROF_PRUNE, || prune_anchors(&mut anchors));
     anchors
 }
 

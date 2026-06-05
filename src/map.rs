@@ -47,11 +47,11 @@ pub(crate) fn map_read_with_occ(fwd: &[u8], rc: &[u8], index: &GIndex,
         let mut anchors = collect_anchors(seq, index, k, s, t, mode,
                                           max_occ, max_occ_l1,
                                           None, None, None);
-        let (top, second_here) = if use_chaining() {
+        let (top, second_here) = timed(&PROF_SELECT, || if use_chaining() {
             chain_dp(&mut anchors)
         } else {
             vote_locus(&mut anchors)
-        };
+        });
         second_score = second_score.max(second_here);
 
         if let Some((chr, pos, score)) = top {
@@ -78,7 +78,7 @@ pub(crate) fn map_read_with_occ(fwd: &[u8], rc: &[u8], index: &GIndex,
 /// that is uncontested.  Naturally low when two genomic loci chain equally well.
 pub(crate) fn map_read(fwd: &[u8], index: &GIndex, k: usize, s: usize, t: usize, mode: SeedMode,
             max_occ: usize, max_occ_l1: usize) -> Option<MapResult> {
-    let rc = revcomp(fwd);
+    let rc = timed(&PROF_RC, || revcomp(fwd));
 
     let try_pass = |mo: usize, mo1: usize| -> Option<MapResult> {
         let (mut best, second_score) =
@@ -298,6 +298,34 @@ pub(crate) fn run_mapping(reads_path: &str, genome_or_idx: &str, paf_out: Option
     println!("  Throughput         : {:>10.0} reads/s  ({:.2} Mbp/s)",
         rps, bps / 1e6);
     println!();
+
+    // ── Per-stage profile (PROFILE=1) ────────────────────────────────────────
+    if profiling() {
+        let rc  = PROF_RC.load(Ordering::Relaxed);
+        let hi  = PROF_HIER.load(Ordering::Relaxed);
+        let em  = PROF_EMIT.load(Ordering::Relaxed);
+        let pr  = PROF_PRUNE.load(Ordering::Relaxed);
+        let se  = PROF_SELECT.load(Ordering::Relaxed);
+        let sum = (rc + hi + em + pr + se).max(1);
+        let nthreads = rayon::current_num_threads() as f64;
+        let ms = |ns: u64| ns as f64 / 1e6;
+        let pct = |ns: u64| 100.0 * ns as f64 / sum as f64;
+        let sd = PROF_SEED.load(Ordering::Relaxed);
+        let l1 = PROF_L1.load(Ordering::Relaxed);
+        let up = PROF_UPPER.load(Ordering::Relaxed);
+        println!("  Per-stage CPU time (summed over {} threads):", nthreads);
+        println!("    revcomp          : {:>10.0} ms  ({:>5.1}%)", ms(rc), pct(rc));
+        println!("    seeding+LCP+hier : {:>10.0} ms  ({:>5.1}%)", ms(hi), pct(hi));
+        println!("      ├ syncmer seed : {:>10.0} ms  ({:>5.1}%)", ms(sd), pct(sd));
+        println!("      ├ L1 parse     : {:>10.0} ms  ({:>5.1}%)", ms(l1), pct(l1));
+        println!("      └ L2..L6 recur : {:>10.0} ms  ({:>5.1}%)", ms(up), pct(up));
+        println!("    index lookups    : {:>10.0} ms  ({:>5.1}%)", ms(em), pct(em));
+        println!("    anchor prune     : {:>10.0} ms  ({:>5.1}%)", ms(pr), pct(pr));
+        println!("    select (vote/dp) : {:>10.0} ms  ({:>5.1}%)", ms(se), pct(se));
+        println!("    ─ profiled total : {:>10.0} ms  (≈ {:.2}s wall ÷ {:.0} thr)",
+                 ms(sum), ms(sum)/1000.0/nthreads, nthreads);
+        println!();
+    }
 }
 
 
