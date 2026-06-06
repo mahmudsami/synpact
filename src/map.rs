@@ -214,8 +214,16 @@ pub(crate) fn run_mapping(reads_path: &str, genome_or_idx: &str, paf_out: Option
     let t0 = Instant::now();
     let mut stats = MapStats::default();
 
-    const BATCH: usize = 100_000;
-    let mut batch: Vec<(String, Vec<u8>)> = Vec::with_capacity(BATCH);
+    // Batch by a fixed *byte budget* of read sequence, not a fixed read count, so
+    // peak memory is independent of read length: a batch always holds ~BATCH_BYTES
+    // of sequence (and, under --cigar, ~that much CIGAR), whether that is many
+    // short reads or few long ones. BATCH_MAX caps the read count for tiny reads.
+    // Batch by sequence-byte budget (--batch-mb) so peak memory is independent of
+    // read length; 0 = unbounded (single batch). BATCH_MAX caps tiny-read counts.
+    let budget = batch_bytes_budget();
+    const BATCH_MAX: usize = 200_000;      // read-count safety cap
+    let mut batch: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut batch_bytes: usize = 0;
 
     // flush_batch: map all reads in parallel, collect results + optional CIGAR
     let flush_batch = |batch: &Vec<(String, Vec<u8>)>,
@@ -262,10 +270,12 @@ pub(crate) fn run_mapping(reads_path: &str, genome_or_idx: &str, paf_out: Option
     };
 
     for read in FastqReader::open(reads_path) {
+        batch_bytes += read.1.len();
         batch.push(read);
-        if batch.len() == BATCH {
+        if batch_bytes >= budget || batch.len() >= BATCH_MAX {
             flush_batch(&batch, &mut stats, &mut paf_writer);
             batch.clear();
+            batch_bytes = 0;
         }
     }
     if !batch.is_empty() {

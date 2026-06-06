@@ -55,6 +55,8 @@ OPTIONS:
   --vote           place reads by diagonal voting (heaviest anchor cluster).
                    This is the default selector — slightly more accurate.
   --chaining       place reads by colinear chain-DP instead of voting.
+  --batch-mb N     per-batch read-sequence budget in MiB (default 256); keeps
+                   peak memory independent of read length. 0 = unbounded.
   --rescue         second relaxed-filter pass for reads that fail the first;
                    maps a few % more reads in repeat-rich regions, emitted at
                    MAPQ 0 (flagged uncertain).  Off by default.
@@ -97,6 +99,14 @@ fn main() {
         .and_then(|p| args.get(p + 1)).and_then(|v| v.parse::<usize>().ok())
     {
         set_min_lvl(v);
+    }
+
+    // --batch-mb N (default 256): per-batch read-sequence budget in MiB; keeps
+    // peak memory independent of read length. 0 = unbounded (single batch).
+    if let Some(v) = args.iter().position(|a| a == "--batch-mb")
+        .and_then(|p| args.get(p + 1)).and_then(|v| v.parse::<usize>().ok())
+    {
+        set_batch_mb(v);
     }
 
     let k: usize = args.iter().position(|a| a == "--k")
