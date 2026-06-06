@@ -125,6 +125,7 @@ syncmer-hifi --map reads.fq.gz genome.idx --ref genome.fa.gz --cigar -o out.paf 
 | `--index-min-level N` | 3 | *(build only)* lowest block level to index; match `--min-level`. Use 0 to support `--min-level 0` mapping |
 | `--vote` | on | place reads by diagonal voting (default selector) |
 | `--chaining` | off | place reads by colinear chain-DP instead of voting |
+| `--batch-mb N` | 256 | per-batch read-sequence budget (MiB); keeps peak memory independent of read length. `0` = unbounded |
 | `--rescue` | off | second relaxed-filter pass for reads that fail the first — recovers a few % more reads in repeat-rich regions, emitted at MAPQ 0 |
 
 `--rescue` runs a second mapping pass (4× looser occurrence filter) **only** on

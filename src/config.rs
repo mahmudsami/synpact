@@ -95,6 +95,23 @@ pub(crate) fn use_chaining() -> bool {
     *USE_CHAINING_CELL.get_or_init(|| std::env::var("CHAINING").map(|v| v == "1").unwrap_or(false))
 }
 
+/// Per-batch read-sequence budget in MiB (`--batch-mb N`, default 256). Reads are
+/// buffered until this many bytes of sequence accumulate, then mapped in parallel.
+/// Batching by bytes (not by read count) keeps peak memory independent of read
+/// length. `0` = unbounded (load the whole input as one batch). Set from the CLI
+/// before mapping; falls back to env BATCH_MB then default 256.
+pub(crate) static BATCH_MB_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+pub(crate) fn set_batch_mb(mb: usize) { let _ = BATCH_MB_CELL.set(mb); }
+
+/// Resolved per-batch budget in *bytes* (`usize::MAX` when unbounded).
+pub(crate) fn batch_bytes_budget() -> usize {
+    let mb = *BATCH_MB_CELL.get_or_init(|| {
+        std::env::var("BATCH_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(256)
+    });
+    if mb == 0 { usize::MAX } else { mb << 20 }
+}
+
 /// Second-pass relaxed-filter rescue for first-pass failures (--rescue).
 /// Off by default; recovered reads are emitted at MAPQ 0 (flagged uncertain).
 pub(crate) static RESCUE: AtomicBool = AtomicBool::new(false);
