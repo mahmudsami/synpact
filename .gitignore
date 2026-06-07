@@ -2,3 +2,4 @@
 Cargo.lock
 *.idx
 *.paf
+.DS_Store

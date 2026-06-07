@@ -23,53 +23,92 @@ pub(crate) struct Block {
     pub(crate) rule:    &'static str,
 }
 
-/// Cole–Vishkin deterministic-coin-tossing tag between two consecutive values.
-/// = 2 * (index of lowest bit where they differ) + (that bit's value in `cur`).
-/// Tags vary non-monotonically even over a sorted run, so their local maxima
-/// give content-determined (locally consistent) split points.
-#[inline]
-pub(crate) fn dct_tag(prev: u64, cur: u64) -> u32 {
-    let d = prev ^ cur;
-    if d == 0 { return 0; }
-    let bit = d.trailing_zeros();
-    2 * bit + ((cur >> bit) & 1) as u32
+/// Cole–Vishkin deterministic coin-tossing: reduce a *proper* colouring (adjacent
+/// entries distinct) of `vals` to a proper **3-colouring** over {0,1,2}, following
+/// "Pearls of Algorithm Engineering", §4.3.2 (List Ranking → Deterministic
+/// Coin-Tossing).  A strictly-monotone run is automatically a proper colouring.
+///
+/// Two phases:
+///   1. *Get six colours.*  Repeat, until every colour `< 6`:
+///        coin'(i) = 2·π(i) + z(i),
+///      where π(i) is the lowest bit position at which coin(i) and its successor
+///      coin(i+1) differ, and z(i) is that bit of coin(i).  Each round keeps the
+///      colouring proper and shrinks the alphabet logarithmically (u64 → <6 in a
+///      handful of rounds).  The last element has no successor, so it is given any
+///      colour distinct from its (new) predecessor.
+///   2. *Get three colours.*  For v = 3,4,5 in turn, recolour every item of
+///      colour v to the smallest colour in {0,1,2} differing from both neighbours.
+///      No two adjacent items share colour v (the colouring is proper), so this is
+///      well-defined and keeps the colouring proper.
+///
+/// Each output colour depends only on a bounded window of `vals` (≈ log* rounds,
+/// successor-directed), so the colouring — and the split derived from it — is
+/// locally consistent: a single changed value perturbs only nearby boundaries.
+fn dct_three_coloring(vals: &[u64]) -> Vec<u8> {
+    let m = vals.len();
+    debug_assert!(m >= 2);
+    let mut coin: Vec<u64> = vals.to_vec();
+
+    // ── Phase 1: reduce to ≤ 6 colours ───────────────────────────────────────
+    while coin.iter().copied().max().unwrap_or(0) >= 6 {
+        let mut next = vec![0u64; m];
+        for i in 0..m - 1 {
+            let p = (coin[i] ^ coin[i + 1]).trailing_zeros() as u64; // first differing bit
+            next[i] = 2 * p + ((coin[i] >> p) & 1);
+        }
+        // Tail (no successor): any colour ≠ its new predecessor keeps it proper.
+        next[m - 1] = if next[m - 2] == 0 { 1 } else { 0 };
+        coin = next;
+    }
+
+    // ── Phase 2: collapse {3,4,5} → {0,1,2}, preserving adjacent-distinctness ──
+    let mut col: Vec<u8> = coin.iter().map(|&c| c as u8).collect();
+    for v in [3u8, 4, 5] {
+        for i in 0..m {
+            if col[i] != v { continue; }
+            let l = if i > 0     { col[i - 1] } else { u8::MAX };
+            let r = if i + 1 < m { col[i + 1] } else { u8::MAX };
+            col[i] = (0u8..=2).find(|&c| c != l && c != r).unwrap();
+        }
+    }
+    col
 }
 
-/// Split a monotone run of indices (whose `values` are strictly monotone) into
-/// consecutive blocks of size ≤3, deterministically, by Cole–Vishkin DCT.
+/// Split a strictly-monotone run of indices (whose `values` are strictly
+/// monotone, hence a proper colouring) into consecutive blocks of size ≤ 3,
+/// deterministically and locally-consistently.
 ///
-/// Boundaries = run start, run end, and every interior position whose DCT tag
-/// is a local maximum (tag[i] > tag[i-1] && tag[i] >= tag[i+1]).  Consecutive
-/// boundaries are emitted as blocks INCLUSIVE of both ends (adjacent blocks
-/// share their boundary index — same intentional-intersection style as the
-/// other rules).  Any gap that still exceeds 2 is chunked left-to-right in
-/// steps of 2 (measured from the local boundary, so still locally determined),
-/// guaranteeing every emitted block spans ≤3 indices.
+/// The run is reduced to a proper 3-colouring by deterministic coin-tossing
+/// (`dct_three_coloring`); boundaries are the run ends plus every interior local
+/// **extremum** (maximum *or* minimum) of that colouring.  Over the alphabet
+/// {0,1,2} no two slope points can be adjacent — four strictly-monotone colours
+/// cannot fit in three — so consecutive boundaries are at most 2 apart, and the
+/// inclusive blocks emitted between them (adjacent blocks sharing their boundary,
+/// matching the intentional-intersection style of the other rules) always span
+/// ≤ 3 indices.  No size-capping/chunking is needed.
 pub(crate) fn split_monotone_run(run: &[usize], values: &[u64]) -> Vec<Vec<usize>> {
     let m = run.len();
     if m <= 3 { return vec![run.to_vec()]; }
 
-    // DCT tag of each run position relative to its predecessor within the run.
-    let tag: Vec<u32> = (0..m)
-        .map(|i| if i == 0 { 0 } else { dct_tag(values[run[i-1]], values[run[i]]) })
-        .collect();
+    // Colour the run by its *content* (the values) so read and reference split
+    // identically wherever the same run occurs.
+    let vals: Vec<u64> = run.iter().map(|&i| values[i]).collect();
+    let col = dct_three_coloring(&vals);
 
-    // Boundary positions (indices into `run`): start, local-max tags, end.
+    // Boundaries: run start, run end, and every interior local extremum.
     let mut bounds = vec![0usize];
     for i in 1..m - 1 {
-        if tag[i] > tag[i-1] && tag[i] >= tag[i+1] { bounds.push(i); }
+        let is_max = col[i] > col[i - 1] && col[i] > col[i + 1];
+        let is_min = col[i] < col[i - 1] && col[i] < col[i + 1];
+        if is_max || is_min { bounds.push(i); }
     }
     if *bounds.last().unwrap() != m - 1 { bounds.push(m - 1); }
 
-    // Emit inclusive blocks between consecutive boundaries; chunk any gap >2.
-    let mut out: Vec<Vec<usize>> = Vec::new();
+    // Inclusive blocks between consecutive boundaries (each ≤ 3 by construction).
+    let mut out: Vec<Vec<usize>> = Vec::with_capacity(bounds.len());
     for w in bounds.windows(2) {
-        let (mut lo, hi) = (w[0], w[1]);
-        while hi - lo > 2 {
-            out.push(run[lo..=lo + 2].to_vec());  // size 3, shares end with next
-            lo += 2;
-        }
-        out.push(run[lo..=hi].to_vec());           // size ≤3
+        debug_assert!(w[1] - w[0] <= 2, "DCT block exceeds size 3");
+        out.push(run[w[0]..=w[1]].to_vec());
     }
     out
 }
@@ -346,3 +385,89 @@ pub(crate) fn extract_hier_blocks_n(seq: &[u8], k: usize, s: usize, t: usize, nu
 // ─────────────────────────────────────────────────────────────────────────────
 // 11.  Genome index (sorted flat array, binary-searched at query time)
 // ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod dct_tests {
+    use super::{dct_three_coloring, split_monotone_run};
+
+    // Tiny deterministic xorshift RNG (no external dep).
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            self.0 = x; x
+        }
+    }
+
+    /// dct_three_coloring must return a proper 3-colouring of any
+    /// adjacent-distinct sequence.
+    #[test]
+    fn three_coloring_is_proper() {
+        let mut rng = Rng(0x9E3779B97F4A7C15);
+        for _ in 0..20_000 {
+            let m = 2 + (rng.next() % 180) as usize;
+            // Build an adjacent-distinct sequence (proper colouring).
+            let mut vals = Vec::with_capacity(m);
+            let mut last = u64::MAX;
+            for _ in 0..m {
+                let mut v = rng.next();
+                if v == last { v ^= 1; }        // force distinct from neighbour
+                vals.push(v);
+                last = v;
+            }
+            let col = dct_three_coloring(&vals);
+            assert_eq!(col.len(), m);
+            assert!(col.iter().all(|&c| c <= 2), "colour out of {{0,1,2}}");
+            for i in 0..m - 1 {
+                assert_ne!(col[i], col[i + 1], "colouring not proper at {i}: {col:?}");
+            }
+        }
+    }
+
+    /// split_monotone_run: every block ≤ 3, adjacent blocks share their boundary,
+    /// the blocks cover the whole run, and it is deterministic — for both strictly
+    /// increasing and strictly decreasing runs.
+    #[test]
+    fn monotone_split_blocks_le_3_and_cover() {
+        let mut rng = Rng(0x1234_5678_9ABC_DEF0);
+        for _ in 0..20_000 {
+            let m = 1 + (rng.next() % 200) as usize;
+            let decreasing = rng.next() & 1 == 0;
+
+            // Strictly monotone values; run indices are 0..m (identity).
+            let run: Vec<usize> = (0..m).collect();
+            let mut values = Vec::with_capacity(m);
+            let mut acc: u64 = (rng.next() % 1000) + 1;
+            for _ in 0..m {
+                values.push(acc);
+                acc += 1 + (rng.next() % 50); // strictly increasing steps
+            }
+            if decreasing { values.reverse(); } // strictly decreasing
+
+            let blocks = split_monotone_run(&run, &values);
+            assert!(!blocks.is_empty());
+
+            // Determinism.
+            let again = split_monotone_run(&run, &values);
+            assert_eq!(blocks, again);
+
+            // Size bound.
+            for b in &blocks {
+                assert!(b.len() >= 1 && b.len() <= 3, "block size {} (m={m}): {b:?}", b.len());
+            }
+            // Coverage + shared-endpoint stitching.
+            assert_eq!(*blocks[0].first().unwrap(), 0);
+            assert_eq!(*blocks.last().unwrap().last().unwrap(), m - 1);
+            for w in blocks.windows(2) {
+                let prev_end = *w[0].last().unwrap();
+                let next_start = *w[1].first().unwrap();
+                assert_eq!(prev_end, next_start, "blocks must share their boundary index");
+            }
+            // Within each block, indices are consecutive.
+            for b in &blocks {
+                for w in b.windows(2) { assert_eq!(w[1], w[0] + 1); }
+            }
+        }
+    }
+}
