@@ -35,12 +35,13 @@ The stream of syncmer values is parsed into non-overlapping **L1 blocks** by
 four content-only rules (local minimum, isolated local maximum, repetition run,
 monotone run). Local minima are robust to mutation, so two copies of a region
 parse into the *same* blocks. Long monotone runs are split deterministically by
-**Cole–Vishkin deterministic coin-tossing**: the run is reduced to a proper
-3-colouring (iterated `coin' = 2·π + z` down to ≤6 colours, then collapsed to
-{0,1,2}), and split at every local extremum of that colouring. Over a 3-colour
-alphabet no two slope points can be adjacent, so this provably yields blocks of
-size ≤3 with a bounded dependence window (locally consistent), carrying
-positional signal without any heuristic length cap.
+**Cole–Vishkin deterministic coin-tossing**: the run (repetition-free, since
+strictly monotone) is reduced to a proper 3-colouring (iterated `coin' = 2·π + z`
+down to ≤6 colours, then collapsed to {0,1,2}), and then parsed by the *same*
+local-minimum and local-maximum rules used above. Over a 3-colour alphabet no two
+slope points are adjacent, so every position is covered by a min/max triplet:
+this provably yields blocks of size ≤3 with a bounded dependence window (locally
+consistent), carrying positional signal without any heuristic length cap.
 
 ### 3. Recursive hierarchy (L1 … L6)
 LCP is applied again to the sequence of L1 block hashes to form L2 blocks, then

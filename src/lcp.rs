@@ -75,17 +75,22 @@ fn dct_three_coloring(vals: &[u64]) -> Vec<u8> {
 }
 
 /// Split a strictly-monotone run of indices (whose `values` are strictly
-/// monotone, hence a proper colouring) into consecutive blocks of size ≤ 3,
-/// deterministically and locally-consistently.
+/// monotone, hence repetition-free) into blocks of size ≤ 3, deterministically
+/// and locally-consistently.
 ///
 /// The run is reduced to a proper 3-colouring by deterministic coin-tossing
-/// (`dct_three_coloring`); boundaries are the run ends plus every interior local
-/// **extremum** (maximum *or* minimum) of that colouring.  Over the alphabet
-/// {0,1,2} no two slope points can be adjacent — four strictly-monotone colours
-/// cannot fit in three — so consecutive boundaries are at most 2 apart, and the
-/// inclusive blocks emitted between them (adjacent blocks sharing their boundary,
-/// matching the intentional-intersection style of the other rules) always span
-/// ≤ 3 indices.  No size-capping/chunking is needed.
+/// (`dct_three_coloring`), then parsed by the **same local-minimum and
+/// local-maximum rules used by the rest of the LCP** (rules 1 and 2): a triplet
+/// `{i-1, i, i+1}` around every local minimum, and around every local maximum
+/// whose neighbours are not minima.  This keeps the monotone-run blocks identical
+/// in form to all other blocks (centred triplets with shared boundaries / the
+/// same intentional-intersection and conservation-of-mass semantics).
+///
+/// Completeness: over the alphabet {0,1,2} no two slope points are adjacent (four
+/// strictly-monotone colours cannot fit in three), so every slope point neighbours
+/// a local maximum and every position is covered by some min/max triplet — the
+/// repetition (rule 3) and monotone (rule 4) cases are unreachable on a 3-colour
+/// proper sequence.  Every emitted block therefore spans ≤ 3 indices; no chunking.
 pub(crate) fn split_monotone_run(run: &[usize], values: &[u64]) -> Vec<Vec<usize>> {
     let m = run.len();
     if m <= 3 { return vec![run.to_vec()]; }
@@ -93,22 +98,27 @@ pub(crate) fn split_monotone_run(run: &[usize], values: &[u64]) -> Vec<Vec<usize
     // Colour the run by its *content* (the values) so read and reference split
     // identically wherever the same run occurs.
     let vals: Vec<u64> = run.iter().map(|&i| values[i]).collect();
-    let col = dct_three_coloring(&vals);
+    let col: Vec<u64> = dct_three_coloring(&vals).iter().map(|&c| c as u64).collect();
 
-    // Boundaries: run start, run end, and every interior local extremum.
-    let mut bounds = vec![0usize];
-    for i in 1..m - 1 {
-        let is_max = col[i] > col[i - 1] && col[i] > col[i + 1];
-        let is_min = col[i] < col[i - 1] && col[i] < col[i + 1];
-        if is_max || is_min { bounds.push(i); }
+    let triplet = |i: usize| {
+        let lo = i.saturating_sub(1);
+        let hi = (i + 1).min(m - 1);
+        run[lo..=hi].to_vec()
+    };
+
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    // Rule 1 — local-minimum triplet.
+    for i in 0..m {
+        if is_local_min(&col, i) { out.push(triplet(i)); }
     }
-    if *bounds.last().unwrap() != m - 1 { bounds.push(m - 1); }
-
-    // Inclusive blocks between consecutive boundaries (each ≤ 3 by construction).
-    let mut out: Vec<Vec<usize>> = Vec::with_capacity(bounds.len());
-    for w in bounds.windows(2) {
-        debug_assert!(w[1] - w[0] <= 2, "DCT block exceeds size 3");
-        out.push(run[w[0]..=w[1]].to_vec());
+    // Rule 2 — local-maximum triplet, when no adjacent local minimum (that min's
+    // own triplet already covers the maximum).
+    for i in 0..m {
+        if is_local_max(&col, i) {
+            let l_min = i > 0     && is_local_min(&col, i - 1);
+            let r_min = i + 1 < m && is_local_min(&col, i + 1);
+            if !l_min && !r_min { out.push(triplet(i)); }
+        }
     }
     out
 }
@@ -425,9 +435,10 @@ mod dct_tests {
         }
     }
 
-    /// split_monotone_run: every block ≤ 3, adjacent blocks share their boundary,
-    /// the blocks cover the whole run, and it is deterministic — for both strictly
-    /// increasing and strictly decreasing runs.
+    /// split_monotone_run: every block ≤ 3 and consecutive, the union of blocks
+    /// covers the whole run (rule-1/2 triplets, so blocks may overlap rather than
+    /// stitch), and it is deterministic — for strictly increasing and decreasing
+    /// runs.
     #[test]
     fn monotone_split_blocks_le_3_and_cover() {
         let mut rng = Rng(0x1234_5678_9ABC_DEF0);
@@ -449,25 +460,19 @@ mod dct_tests {
             assert!(!blocks.is_empty());
 
             // Determinism.
-            let again = split_monotone_run(&run, &values);
-            assert_eq!(blocks, again);
+            assert_eq!(blocks, split_monotone_run(&run, &values));
 
-            // Size bound.
+            // Size bound + consecutive indices within each block.
             for b in &blocks {
                 assert!(b.len() >= 1 && b.len() <= 3, "block size {} (m={m}): {b:?}", b.len());
-            }
-            // Coverage + shared-endpoint stitching.
-            assert_eq!(*blocks[0].first().unwrap(), 0);
-            assert_eq!(*blocks.last().unwrap().last().unwrap(), m - 1);
-            for w in blocks.windows(2) {
-                let prev_end = *w[0].last().unwrap();
-                let next_start = *w[1].first().unwrap();
-                assert_eq!(prev_end, next_start, "blocks must share their boundary index");
-            }
-            // Within each block, indices are consecutive.
-            for b in &blocks {
                 for w in b.windows(2) { assert_eq!(w[1], w[0] + 1); }
             }
+
+            // Full coverage: the union of all blocks must hit every run index.
+            let mut covered = vec![false; m];
+            for b in &blocks { for &i in b { covered[i] = true; } }
+            assert!(covered.iter().all(|&c| c),
+                    "uncovered index (m={m}, decreasing={decreasing})");
         }
     }
 }
