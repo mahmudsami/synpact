@@ -150,7 +150,7 @@ pub(crate) fn locally_consistent_parsing(values: &[u64]) -> Vec<Block> {
     // Inclusive commit: all positions including already-assigned (all rules)
     macro_rules! commit_incl {
         ($idxs:expr, $rule:expr) => {{
-            let all: Vec<usize> = $idxs.iter().copied().filter(|&i| i < n).collect();
+            let all: Vec<usize> = $idxs.into_iter().filter(|&i| i < n).collect();
             if all.iter().any(|&i| !assigned[i]) {
                 for &i in &all { assigned[i] = true; }
                 blocks.push(Block { indices: all, rule: $rule });
@@ -165,7 +165,7 @@ pub(crate) fn locally_consistent_parsing(values: &[u64]) -> Vec<Block> {
         if is_min[i] {
             let lo = i.saturating_sub(1);
             let hi = (i + 1).min(n - 1);
-            commit_incl!((lo..=hi).collect::<Vec<_>>(), "local_min");
+            commit_incl!(lo..=hi, "local_min");
         }
     }
 
@@ -178,7 +178,7 @@ pub(crate) fn locally_consistent_parsing(values: &[u64]) -> Vec<Block> {
             if !l_is_min && !r_is_min {
                 let lo = i.saturating_sub(1);
                 let hi = (i + 1).min(n - 1);
-                commit_incl!((lo..=hi).collect::<Vec<_>>(), "local_max");
+                commit_incl!(lo..=hi, "local_max");
             }
         }
     }
@@ -192,7 +192,7 @@ pub(crate) fn locally_consistent_parsing(values: &[u64]) -> Vec<Block> {
             if j - i >= 2 {
                 let lo = i.saturating_sub(1);
                 let hi = j.min(n - 1); // j is one past the run; j is the next syncmer
-                commit_incl!((lo..=hi).collect::<Vec<_>>(), "repetition");
+                commit_incl!(lo..=hi, "repetition");
             }
             i = j;
         }
@@ -255,8 +255,7 @@ pub(crate) fn extract_all_levels(seq: &[u8], k: usize, s: usize, t: usize, max_l
     let mut first_out: Vec<(u64, u32)> = Vec::with_capacity(l1_raw.len());
 
     for blk in &l1_raw {
-        let bvals: Vec<u64> = blk.indices.iter().map(|&i| smer_vals[i]).collect();
-        let h   = block_hash_for_level(&bvals, 0);
+        let h   = block_hash_indices_for_level(&blk.indices, &smer_vals, 0);
         let pos = syncmers[blk.indices[0]].pos;
         cur_hashes.push(h);
         cur_pos.push(pos);
@@ -275,8 +274,7 @@ pub(crate) fn extract_all_levels(seq: &[u8], k: usize, s: usize, t: usize, max_l
         let mut level_out   = Vec::with_capacity(next_raw.len());
 
         for blk in &next_raw {
-            let bvals: Vec<u64> = blk.indices.iter().map(|&i| cur_hashes[i]).collect();
-            let h   = block_hash_for_level(&bvals, level_1idx - 1);
+            let h   = block_hash_indices_for_level(&blk.indices, &cur_hashes, level_1idx - 1);
             let pos = cur_pos[blk.indices[0]];
             next_hashes.push(h);
             next_pos.push(pos);
@@ -338,8 +336,7 @@ pub(crate) fn extract_hier_blocks_n(seq: &[u8], k: usize, s: usize, t: usize, nu
     for blk in &l1_raw { for &i in &blk.indices { sync_membership[i] += 1; } }
 
     let l1: Vec<HierNode> = l1_raw.iter().map(|blk| {
-        let bvals: Vec<u64> = blk.indices.iter().map(|&i| smer_vals[i]).collect();
-        let h   = block_hash_for_level(&bvals, 0);
+        let h   = block_hash_indices_for_level(&blk.indices, &smer_vals, 0);
         let pos = syncmers[blk.indices[0]].pos;
         let end = syncmers[*blk.indices.last().unwrap()].pos + k as u32;
         let mass: f32 = blk.indices.iter()
@@ -373,8 +370,7 @@ pub(crate) fn extract_hier_blocks_n(seq: &[u8], k: usize, s: usize, t: usize, nu
             for blk in &next_raw { for &i in &blk.indices { child_membership[i] += 1; } }
 
             let new_level: Vec<HierNode> = next_raw.iter().map(|blk| {
-                let bvals: Vec<u64> = blk.indices.iter().map(|&i| cur_hashes[i]).collect();
-                let h        = block_hash_for_level(&bvals, level_1idx - 1);
+                let h        = block_hash_indices_for_level(&blk.indices, &cur_hashes, level_1idx - 1);
                 let pos      = cur_pos[blk.indices[0]];
                 let end      = cur_end[*blk.indices.last().unwrap()];
                 // Parent mass = sum of each child's mass / (#parents sharing that child).
