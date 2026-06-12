@@ -182,13 +182,21 @@ pub(crate) fn block_hash_for_level(values: &[u64], level_0idx: usize) -> u64 {
 // Backward-compatible aliases used by the demo/stats display code.
 
 pub(crate) fn block_hash_with_domain(values: &[u64], domain: u64) -> u64 {
+    block_hash_iter_domain(values.len(), values.iter().copied(), domain)
+}
+
+/// Hash `len` block values (yielded by `vals`) into the given domain. Taking an
+/// iterator lets callers hash directly from an index list without materialising
+/// a temporary `Vec` of the gathered values.
+#[inline]
+pub(crate) fn block_hash_iter_domain(len: usize, vals: impl Iterator<Item = u64>, domain: u64) -> u64 {
     // Seed mixes in both length and domain so that:
     //   • blocks of different lengths can't collide (even with same prefix)
     //   • L1 and L2 occupy disjoint hash spaces
-    let mut h: u64 = (values.len() as u64)
+    let mut h: u64 = (len as u64)
         .wrapping_mul(0xbf58476d1ce4e5b9)
         ^ domain;
-    for &v in values {
+    for v in vals {
         h = h.rotate_left(13).wrapping_add(v);
         // SplitMix64 avalanche step
         h ^= h >> 30;
@@ -198,6 +206,13 @@ pub(crate) fn block_hash_with_domain(values: &[u64], domain: u64) -> u64 {
         h ^= h >> 31;
     }
     h
+}
+
+/// Hash a block whose values are `src[i]` for each `i` in `indices`, at the given
+/// 0-indexed level — without gathering them into a temporary `Vec` first.
+#[inline]
+pub(crate) fn block_hash_indices_for_level(indices: &[usize], src: &[u64], level_0idx: usize) -> u64 {
+    block_hash_iter_domain(indices.len(), indices.iter().map(|&i| src[i]), level_domain(level_0idx))
 }
 
 
