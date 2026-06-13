@@ -1,21 +1,6 @@
-#![allow(unused_imports, dead_code)]
-use crate::config::*;
-use crate::hash::*;
-use crate::syncmer::*;
-use crate::lcp::*;
-use crate::index::*;
-use crate::align::*;
-use crate::chain::*;
-use crate::map::*;
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader};
 use std::fs::File;
-use std::time::Instant;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
-use std::cell::RefCell;
-use std::collections::HashSet;
 use flate2::read::MultiGzDecoder;
-use rayon::prelude::*;
 
 pub(crate) fn revcomp(seq: &[u8]) -> Vec<u8> {
     seq.iter().rev().map(|&b| match b.to_ascii_uppercase() {

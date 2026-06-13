@@ -1,26 +1,10 @@
-#![allow(unused_imports, dead_code)]
 use crate::config::*;
 use crate::hash::*;
 use crate::syncmer::*;
-use crate::index::*;
-use crate::fastq::*;
-use crate::align::*;
-use crate::chain::*;
-use crate::map::*;
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
-use std::fs::File;
-use std::time::Instant;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
-use std::cell::RefCell;
-use std::collections::HashSet;
-use flate2::read::MultiGzDecoder;
-use rayon::prelude::*;
 
 #[derive(Debug)]
 pub(crate) struct Block {
     pub(crate) indices: Vec<usize>,
-    pub(crate) rule:    &'static str,
 }
 
 /// Cole–Vishkin deterministic coin-tossing: reduce a *proper* colouring (adjacent
@@ -138,7 +122,7 @@ pub(crate) fn is_local_max(v: &[u64], i: usize) -> bool {
 pub(crate) fn locally_consistent_parsing(values: &[u64]) -> Vec<Block> {
     let n = values.len();
     if n == 0 { return vec![]; }
-    if n == 1 { return vec![Block { indices: vec![0], rule: "local_min" }]; }
+    if n == 1 { return vec![Block { indices: vec![0] }]; }
 
     // Vec<bool> instead of HashSet — better cache behaviour at genome scale
     let is_min: Vec<bool> = (0..n).map(|i| is_local_min(values, i)).collect();
@@ -149,11 +133,11 @@ pub(crate) fn locally_consistent_parsing(values: &[u64]) -> Vec<Block> {
 
     // Inclusive commit: all positions including already-assigned (all rules)
     macro_rules! commit_incl {
-        ($idxs:expr, $rule:expr) => {{
+        ($idxs:expr) => {{
             let all: Vec<usize> = $idxs.into_iter().filter(|&i| i < n).collect();
             if all.iter().any(|&i| !assigned[i]) {
                 for &i in &all { assigned[i] = true; }
-                blocks.push(Block { indices: all, rule: $rule });
+                blocks.push(Block { indices: all });
             }
         }};
     }
@@ -165,7 +149,7 @@ pub(crate) fn locally_consistent_parsing(values: &[u64]) -> Vec<Block> {
         if is_min[i] {
             let lo = i.saturating_sub(1);
             let hi = (i + 1).min(n - 1);
-            commit_incl!(lo..=hi, "local_min");
+            commit_incl!(lo..=hi);
         }
     }
 
@@ -178,7 +162,7 @@ pub(crate) fn locally_consistent_parsing(values: &[u64]) -> Vec<Block> {
             if !l_is_min && !r_is_min {
                 let lo = i.saturating_sub(1);
                 let hi = (i + 1).min(n - 1);
-                commit_incl!(lo..=hi, "local_max");
+                commit_incl!(lo..=hi);
             }
         }
     }
@@ -192,7 +176,7 @@ pub(crate) fn locally_consistent_parsing(values: &[u64]) -> Vec<Block> {
             if j - i >= 2 {
                 let lo = i.saturating_sub(1);
                 let hi = j.min(n - 1); // j is one past the run; j is the next syncmer
-                commit_incl!(lo..=hi, "repetition");
+                commit_incl!(lo..=hi);
             }
             i = j;
         }
@@ -210,12 +194,11 @@ pub(crate) fn locally_consistent_parsing(values: &[u64]) -> Vec<Block> {
             b -= 1;
             if b > a + 1 && assigned[b] && (a + 1..b).any(|j| !assigned[j]) {
                 let run: Vec<usize> = (a..=b).collect();
-                let rule = if sign == 1 { "mono_inc" } else { "mono_dec" };
                 // Split long monotone runs into ≤3-unit blocks via DCT so they
                 // aren't one big featureless block (deterministic & locally
                 // consistent → genome and read split identically).
                 for sub in split_monotone_run(&run, values) {
-                    commit_incl!(sub, rule);
+                    commit_incl!(sub);
                 }
             }
         }

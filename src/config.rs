@@ -1,21 +1,6 @@
-#![allow(unused_imports, dead_code)]
-use crate::hash::*;
-use crate::syncmer::*;
-use crate::lcp::*;
-use crate::index::*;
-use crate::fastq::*;
-use crate::align::*;
-use crate::chain::*;
-use crate::map::*;
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
-use std::fs::File;
 use std::time::Instant;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
-use std::cell::RefCell;
-use std::collections::HashSet;
-use flate2::read::MultiGzDecoder;
-use rayon::prelude::*;
 
 // ── Per-stage profiling (env PROFILE=1) ─────────────────────────────────────
 // Each counter accumulates wall-nanoseconds summed across all worker threads.
@@ -48,52 +33,16 @@ pub(crate) fn timed<T>(ctr: &AtomicU64, f: impl FnOnce() -> T) -> T {
     }
 }
 
-/// Hierarchy-atom selector.  When true, LCP uses the full k-mer as each leaf
-/// value (high specificity, best for low-error HiFi).  When false (default),
-/// it uses the middle s-mer (more error-tolerant, best for ONT).
-/// Set once at startup from the CLI / loaded index, before any parallel work.
-pub(crate) static KMER_ATOM: AtomicBool = AtomicBool::new(false);
-#[inline] pub(crate) fn kmer_atom() -> bool { KMER_ATOM.load(Ordering::Relaxed) }
-
-/// Canonical-atom selector.  When true, each atom value is min(encode(atom),
-/// encode(revcomp(atom))) so a sequence and its reverse-complement share a key.
-/// Halves the atom value space (less specificity) — tested as an alternative.
-pub(crate) static CANON_ATOM: AtomicBool = AtomicBool::new(false);
-#[inline] pub(crate) fn canon_atom() -> bool { CANON_ATOM.load(Ordering::Relaxed) }
-
-/// Disable the L0 raw-syncmer fallback at query time (env NO_L0=1).
-pub(crate) fn no_l0() -> bool {
-    use std::sync::OnceLock; static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("NO_L0").map(|v| v == "1").unwrap_or(false))
-}
-
-/// Minimum hierarchy level whose blocks may produce anchors (`--min-level N`,
-/// default 3). Blocks below this level are neither emitted nor recursed into — the
-/// read is placed only by the coarser, more-unique high-level blocks, which at HiFi
-/// error rates removes paralog/segmental-dup ambiguity (higher accuracy + faster).
-/// A floor > 0 also disables the L0 raw-syncmer fallback.
-/// Set once from the CLI before mapping; falls back to env MIN_LVL then default 3.
+/// Minimum hierarchy level whose blocks may produce anchors, and the lowest level
+/// the index stores (`--min-level N`, default 3 — one unified value). Blocks below
+/// this level are neither stored nor used; the read is placed only by the coarser,
+/// more-unique high-level blocks, which at HiFi error rates removes paralog /
+/// segmental-dup ambiguity (higher accuracy + faster). Set once from the CLI.
 pub(crate) static MIN_LVL_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 pub(crate) fn set_min_lvl(v: usize) { let _ = MIN_LVL_CELL.set(v); }
 
-pub(crate) fn min_lvl() -> usize {
-    *MIN_LVL_CELL.get_or_init(|| {
-        std::env::var("MIN_LVL").ok().and_then(|v| v.parse().ok()).unwrap_or(3)
-    })
-}
-
-/// Locus selector. Default is diagonal **voting** (`--vote`): pick the heaviest
-/// anchor cluster on a diagonal. `--chaining` (env CHAINING=1) instead uses the
-/// colinear gap-penalised chain-DP. Voting is slightly more accurate on contested
-/// reads; both run at the same speed (chaining is not the bottleneck).
-pub(crate) static USE_CHAINING_CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
-pub(crate) fn set_chaining(v: bool) { let _ = USE_CHAINING_CELL.set(v); }
-
-pub(crate) fn use_chaining() -> bool {
-    *USE_CHAINING_CELL.get_or_init(|| std::env::var("CHAINING").map(|v| v == "1").unwrap_or(false))
-}
+pub(crate) fn min_lvl() -> usize { *MIN_LVL_CELL.get_or_init(|| 3) }
 
 /// Per-batch read-sequence budget in MiB (`--batch-mb N`, default 256). Reads are
 /// buffered until this many bytes of sequence accumulate, then mapped in parallel.
@@ -111,11 +60,6 @@ pub(crate) fn batch_bytes_budget() -> usize {
     });
     if mb == 0 { usize::MAX } else { mb << 20 }
 }
-
-/// Second-pass relaxed-filter rescue for first-pass failures (--rescue).
-/// Off by default; recovered reads are emitted at MAPQ 0 (flagged uncertain).
-pub(crate) static RESCUE: AtomicBool = AtomicBool::new(false);
-#[inline] pub(crate) fn rescue_pass() -> bool { RESCUE.load(Ordering::Relaxed) }
 
 pub(crate) fn commas(n: u64) -> String {
     let s = n.to_string();

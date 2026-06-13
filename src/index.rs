@@ -1,19 +1,9 @@
-#![allow(unused_imports, dead_code)]
 use crate::config::*;
-use crate::hash::*;
 use crate::syncmer::*;
 use crate::lcp::*;
-use crate::fastq::*;
-use crate::align::*;
-use crate::chain::*;
-use crate::map::*;
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::fs::File;
 use std::time::Instant;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
-use std::cell::RefCell;
-use std::collections::HashSet;
 use flate2::read::MultiGzDecoder;
 use rayon::prelude::*;
 
@@ -40,7 +30,6 @@ pub(crate) struct Level {
 
 impl Level {
     #[inline] pub(crate) fn len(&self) -> usize { self.hashes.len() }
-    #[inline] pub(crate) fn is_empty(&self) -> bool { self.hashes.is_empty() }
 
     /// Build a SoA level from an AoS entry vector (used during index build).
     pub(crate) fn from_aos(entries: Vec<(u64, u8, u32)>) -> Self {
@@ -132,11 +121,11 @@ pub(crate) fn read_fasta_chrs(path: &str) -> Vec<(String, Vec<u8>)> {
 /// Extract entries for all N levels from one chromosome (N-split on 'N' runs).
 /// Returns a Vec of N vecs: result[0] = L1 entries, result[1] = L2, …
 pub(crate) fn chr_to_entries_n(chr_id: u8, seq: &[u8], k: usize, s: usize, t: usize, max_levels: usize,
-                    idx_min_level: usize, mode: SeedMode) -> Vec<Vec<(u64, u8, u32)>>
+                    mode: SeedMode) -> Vec<Vec<(u64, u8, u32)>>
 {
-    // slots 0..max_levels-1 = L1-L{max_levels} blocks. Levels below idx_min_level
-    // (the GIndex level index, where L0 is the raw-syncmer level) are not stored —
-    // per_level slot `li` holds L(li+1), so we keep slots with li+1 >= idx_min_level.
+    // per_level slot `li` holds L(li+1). Levels below --min-level are not stored
+    // (kept as empty slots so a block's level still indexes its array).
+    let min_level = min_lvl();
     let mut per_level: Vec<Vec<(u64, u8, u32)>> = vec![Vec::new(); max_levels];
     let mut seg_start: Option<usize> = None;
 
@@ -144,7 +133,7 @@ pub(crate) fn chr_to_entries_n(chr_id: u8, seq: &[u8], k: usize, s: usize, t: us
         if end - s0 < k { return; }
         let levels = extract_all_levels(&seq[s0..end], k, s, t, max_levels, mode);
         for (li, entries) in levels.into_iter().enumerate() {
-            if li < per_level.len() && (li + 1) >= idx_min_level {
+            if li < per_level.len() && (li + 1) >= min_level {
                 for (h, pos) in entries {
                     per_level[li].push((h, chr_id, s0 as u32 + pos));
                 }
@@ -164,85 +153,11 @@ pub(crate) fn chr_to_entries_n(chr_id: u8, seq: &[u8], k: usize, s: usize, t: us
     per_level
 }
 
-/// Build the L0 (raw-syncmer) index level sequentially in fixed-size chunks.
-///
-/// Processes one chromosome at a time, each chromosome in CHUNK_SIZE-bp slices.
-/// Peak memory per chunk ≈ 2 × CHUNK_SIZE × 8 bytes (smer + kmer hash arrays) = 160 MB.
-/// The growing `all_l0` accumulator is the dominant memory user (~700M × 13 bytes ≈ 9 GB
-/// for the human genome before filtering); it is safe on a 32 GB machine.
-///
-/// Returns a sorted, occ-filtered slice ready for `GIndex.levels[0]`.
-pub(crate) fn extract_l0_sequential(
-    chrs: &[(String, Vec<u8>)],
-    k: usize, s: usize, t: usize,
-    mode: SeedMode,
-    max_occ: usize,
-) -> Vec<(u64, u8, u32)>
-{
-    const CHUNK_SIZE: usize = 10_000_000; // 10 Mbp → ~80 MB per hash array
-    let overlap = k - 1; // left extension so syncmers near chunk boundaries aren't missed
-
-    let mut all_l0: Vec<(u64, u8, u32)> = Vec::new();
-
-    for (chr_id, (_name, seq)) in chrs.iter().enumerate() {
-        if seq.len() < k { continue; }
-        let chr_id = chr_id as u8;
-
-        let mut owned_start = 0usize;
-        while owned_start < seq.len() {
-            // Extend chunk leftward so the full k-mer window is available for
-            // syncmers whose left edge is just at `owned_start`.
-            let chunk_start = owned_start.saturating_sub(overlap);
-            let chunk_end   = (owned_start + CHUNK_SIZE).min(seq.len());
-
-            let chunk = &seq[chunk_start..chunk_end];
-            if chunk.len() < k { owned_start += CHUNK_SIZE; continue; }
-
-            // Syncmer positions within this chunk (N-containing k-mers already skipped).
-            let syncmers = select_seeds_light(chunk, k, s, t, mode);
-
-            // k-mer NT-hashes for the chunk — the lookup keys stored in L0.
-            let kmer_hashes: Vec<u64> = match DnaHashFwd::new(chunk, k) {
-                Some(it) => it.collect(),
-                None     => { owned_start += CHUNK_SIZE; continue; }
-            };
-
-            for sm in &syncmers {
-                let abs_pos = chunk_start + sm.pos as usize;
-                // Assign each syncmer to exactly one chunk (the one that "owns" its abs pos).
-                if abs_pos >= owned_start && abs_pos < chunk_end {
-                    let local = sm.pos as usize;
-                    if local < kmer_hashes.len() {
-                        all_l0.push((kmer_hashes[local], chr_id, abs_pos as u32));
-                    }
-                }
-            }
-
-            owned_start += CHUNK_SIZE;
-        }
-    }
-
-    // Sort by hash for binary-search lookup, then filter repetitive k-mers.
-    all_l0.sort_unstable_by_key(|e| e.0);
-    let before = all_l0.len();
-    let mut filtered: Vec<(u64, u8, u32)> = Vec::with_capacity(before);
-    let mut i = 0;
-    while i < all_l0.len() {
-        let h  = all_l0[i].0;
-        let mut j = i + 1;
-        while j < all_l0.len() && all_l0[j].0 == h { j += 1 }
-        if j - i <= max_occ { filtered.extend_from_slice(&all_l0[i..j]); }
-        i = j;
-    }
-    eprintln!("      L0 raw syncmers: {} total → {} after occ≤{} filter",
-              commas(before as u64), commas(filtered.len() as u64), max_occ);
-    filtered
-}
-
 pub(crate) fn build_index(genome_path: &str, k: usize, s: usize, t: usize, max_levels: usize,
-               idx_min_level: usize, mode: SeedMode) -> (GIndex, std::time::Duration)
+               mode: SeedMode) -> (GIndex, std::time::Duration)
 {
     let t0 = Instant::now();
+    let min_level = min_lvl();
 
     print!("    reading sequences ... ");
     std::io::stdout().flush().ok();
@@ -251,12 +166,12 @@ pub(crate) fn build_index(genome_path: &str, k: usize, s: usize, t: usize, max_l
 
     let chr_names: Vec<String> = chrs.iter().map(|(n, _)| n.clone()).collect();
 
-    print!("    extracting levels ≥ {idx_min_level} of {max_levels} (parallel) ... ");
+    print!("    extracting levels ≥ {min_level} of {max_levels} (parallel) ... ");
     std::io::stdout().flush().ok();
 
     // Parallel per-chromosome extraction
     let all: Vec<Vec<Vec<(u64, u8, u32)>>> = chrs.par_iter().enumerate()
-        .map(|(chr_id, (_, seq))| chr_to_entries_n(chr_id as u8, seq, k, s, t, max_levels, idx_min_level, mode))
+        .map(|(chr_id, (_, seq))| chr_to_entries_n(chr_id as u8, seq, k, s, t, max_levels, mode))
         .collect();
 
     // Merge across chromosomes
@@ -276,21 +191,9 @@ pub(crate) fn build_index(genome_path: &str, k: usize, s: usize, t: usize, max_l
     }
     println!("done");
 
-    // Build L0 (raw syncmers) sequentially in 10 Mbp chunks to stay within
-    // memory budget — only when L0 is within the requested floor.  L1-L{max_levels}
-    // are already sorted in `merged`.
-    let l0 = if idx_min_level == 0 {
-        print!("    building L0 raw-syncmer level (sequential, 10 Mbp chunks) ... ");
-        std::io::stdout().flush().ok();
-        let l0 = extract_l0_sequential(&chrs, k, s, t, mode, MAX_OCC_L1_DEFAULT);
-        println!("done  ({} entries, occ≤{})", commas(l0.len() as u64), MAX_OCC_L1_DEFAULT);
-        l0
-    } else {
-        Vec::new()  // L0 skipped; default mapping (--min-level 3) never reads it.
-    };
-
-    // Prepend L0 so GIndex.levels[0]=L0, levels[1]=L1, …
-    merged.insert(0, l0);
+    // levels[0] is an unused placeholder (the old L0 raw-syncmer slot) so block
+    // levels still index directly: levels[1]=L1, levels[2]=L2, …
+    merged.insert(0, Vec::new());
 
     let level_counts: Vec<String> = merged.iter().enumerate()
         .map(|(li, v)| format!("L{}: {}", li, commas(v.len() as u64)))
@@ -305,24 +208,17 @@ pub(crate) fn build_index(genome_path: &str, k: usize, s: usize, t: usize, max_l
 }
 
 // ── Index serialisation ───────────────────────────────────────────────────────
-// Format v7  ("SYNCL2\x07\x00"):
+// Format v7 ("SYNCL2\x07\x00"):
 //   8  bytes  magic
-//   4  bytes  k  (u32 LE)
-//   4  bytes  s  (u32 LE)
-//   4  bytes  t  (u32 LE)
-//   1  byte   seed_mode  (0 = Syncmer)
-//   1  byte   atom flags (bit0 = k-mer atom, bit1 = canonical)
-//   4  bytes  num_chrs  (u32 LE)
-//   for each chr: 4-byte len + UTF-8 bytes
-//   4  bytes  num_levels  (u32 LE)
-//   for level 0 … num_levels-1:
-//       8  bytes  num_entries  (u64 LE)
-//       num_entries × 13 bytes  (8-byte hash + 1-byte chr_id + 4-byte pos)
-//   Level 0 = L0 raw-syncmer fallback, level 1 = L1 blocks, …
-// Older formats (v4–v6) still load (atom flags default off).
+//   4  bytes  k  (u32 LE)   4 bytes  s   4 bytes  t
+//   1  byte   seed_mode (0 = Syncmer)   1 byte  atom flag (always 1 = k-mer atom)
+//   4  bytes  num_chrs (u32 LE);  per chr: 4-byte len + UTF-8 bytes
+//   4  bytes  num_levels (u32 LE)
+//   per level: 8-byte num_entries + entries × 13 bytes (8 hash | 1 chr | 4 pos)
+//   Stored level 0 = unused placeholder, level 1 = L1 blocks, level 2 = L2, …
+// v6/v7 load; older formats must be rebuilt.
 
-/// Write one level in the packed 13-bytes/entry on-disk format (unchanged from
-/// the AoS era, so existing v6 index files remain compatible).
+/// Write one level in the packed 13-bytes/entry on-disk format.
 pub(crate) fn write_entries(w: &mut impl Write, lvl: &Level) {
     w.write_all(&(lvl.len() as u64).to_le_bytes()).unwrap();
     for i in 0..lvl.len() {
@@ -343,9 +239,8 @@ pub(crate) fn save_index(idx: &GIndex, path: &str, k: usize, s: usize, t: usize,
     w.write_all(&(s as u32).to_le_bytes()).unwrap();
     w.write_all(&(t as u32).to_le_bytes()).unwrap();
     w.write_all(&[mode as u8]).unwrap();
-    // v7 flag byte: bit0 = k-mer atom, bit1 = canonical atom.
-    let flags = (kmer_atom() as u8) | ((canon_atom() as u8) << 1);
-    w.write_all(&[flags]).unwrap();
+    // Atom flag byte: bit0 = k-mer atom (always 1 now); kept for format stability.
+    w.write_all(&[1u8]).unwrap();
     w.write_all(&(idx.chr_names.len() as u32).to_le_bytes()).unwrap();
     for name in &idx.chr_names {
         let b = name.as_bytes();
@@ -385,15 +280,11 @@ pub(crate) fn load_index(path: &str) -> (GIndex, usize, usize, usize, SeedMode) 
     } else {
         SeedMode::Syncmer
     };
-    // v7+: flag byte (bit0 = k-mer atom, bit1 = canonical).  Older = s-mer, fwd.
+    // v7+: 1-byte atom flag follows the seed-mode byte. The atom is always the
+    // full k-mer now, so the flag is read and ignored.
     if version >= 7 {
         let mut b = [0u8; 1];
         r.read_exact(&mut b).unwrap();
-        KMER_ATOM.store(b[0] & 1 != 0, Ordering::Relaxed);
-        CANON_ATOM.store(b[0] & 2 != 0, Ordering::Relaxed);
-    } else {
-        KMER_ATOM.store(false, Ordering::Relaxed);
-        CANON_ATOM.store(false, Ordering::Relaxed);
     }
 
     let num_chrs = read_u32le(&mut r) as usize;
@@ -430,33 +321,10 @@ pub(crate) fn load_index(path: &str) -> (GIndex, usize, usize, usize, SeedMode) 
         Level { hashes, chrs, poss }
     }
 
-    let levels: Vec<Level> = if version >= 6 {
-        // v6: explicit num_levels + entries in level order (L0, L1, L2, …)
-        let num_levels = read_u32le(&mut r) as usize;
-        (0..num_levels).map(|_| read_level(&mut r)).collect()
-    } else if version >= 4 {
-        // v4/v5: no L0 level — prepend an empty L0 slot so existing level
-        // numbering (L1 at GIndex.levels[1], etc.) remains consistent.
-        let num_levels = read_u32le(&mut r) as usize;
-        std::iter::once(Level::default())
-            .chain((0..num_levels).map(|_| read_level(&mut r)))
-            .collect()
-    } else if version == 3 {
-        // v3 legacy: L2, L1, L3 — prepend empty L0
-        let l2 = read_level(&mut r);
-        let l1 = read_level(&mut r);
-        let l3 = read_level(&mut r);
-        vec![Level::default(), l1, l2, l3]
-    } else if version == 2 {
-        // v2 legacy: L2, L1 — prepend empty L0
-        let l2 = read_level(&mut r);
-        let l1 = read_level(&mut r);
-        vec![Level::default(), l1, l2]
-    } else {
-        // v1 legacy: L2 only — prepend empty L0 and empty L1
-        let l2 = read_level(&mut r);
-        vec![Level::default(), Level::default(), l2]
-    };
+    assert!(version >= 6, "index version {version} too old; rebuild with --build-index");
+    // Explicit num_levels + entries in level order (level 0 = unused placeholder).
+    let num_levels = read_u32le(&mut r) as usize;
+    let levels: Vec<Level> = (0..num_levels).map(|_| read_level(&mut r)).collect();
 
     (GIndex { levels, chr_names }, k, s, t, mode)
 }
@@ -465,9 +333,7 @@ pub(crate) fn load_index(path: &str) -> (GIndex, usize, usize, usize, SeedMode) 
 // 12.  FASTQ reader + reverse complement
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub(crate) const MAX_OCC_DEFAULT:    usize = 500;
-
-pub(crate) const MAX_OCC_L1_DEFAULT: usize = 200;
+pub(crate) const MAX_OCC_DEFAULT: usize = 10_000;
 
 /// Maximum number of hierarchy levels to build (L1 … L_MAX_LEVELS).
 /// MEASURED block spans (k=19,s=10): each level grows ~2.27× (≈avg children
@@ -478,18 +344,8 @@ pub(crate) const MAX_OCC_L1_DEFAULT: usize = 200;
 /// the L7 level is only ~1% usable, doesn't short-circuit) → kept at 6.
 pub(crate) const MAX_LEVELS: usize = 6;
 
-/// Vote weight for a match at hierarchy level L (0-indexed: L0=1, L1=1, L2=3, L3=9, …).
-/// L0 (raw syncmer fallback) shares the same weight as L1 blocks.
-/// Each level above L1 is 3× the one below it.
-#[inline]
-#[allow(dead_code)]
-pub(crate) fn vote_weight(level: usize) -> u32 {
-    if level == 0 { 1 } else { 3u32.pow((level - 1) as u32) }
-}
-
-/// Maximum occurrences allowed at each level.
-/// Level is 0-indexed: 0 = L0 raw syncmers, 1 = L1 blocks, 2 = L2, …
-///   L0/L1: base_l1   L2/L3: base   L4: base/5   L5: base/20   L6+: base/100
+/// Maximum occurrences allowed at each level (level index: 1 = L1, 2 = L2, …;
+/// 0 is the unused placeholder). L1: base_l1  L2/L3: base  L4: /5  L5: /20  L6+: /100.
 #[inline]
 pub(crate) fn max_occ_for_level(level: usize, base: usize, base_l1: usize) -> usize {
     match level {
