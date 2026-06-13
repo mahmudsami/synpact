@@ -1,21 +1,5 @@
-#![allow(unused_imports, dead_code)]
-use crate::config::*;
 use crate::hash::*;
-use crate::lcp::*;
-use crate::index::*;
-use crate::fastq::*;
-use crate::align::*;
-use crate::chain::*;
-use crate::map::*;
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
-use std::fs::File;
-use std::time::Instant;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
-use std::cell::RefCell;
-use std::collections::{HashSet, VecDeque};
-use flate2::read::MultiGzDecoder;
-use rayon::prelude::*;
+use std::collections::VecDeque;
 
 /// Lightweight record for genome-scale processing.
 #[derive(Clone)]
@@ -58,10 +42,8 @@ pub(crate) fn select_syncmers_light(seq: &[u8], k: usize, s: usize, t: usize) ->
         if min_j == t {
             let kmer = &seq[i..i + k];
             if kmer.iter().any(|&b| matches!(b.to_ascii_uppercase(), b'N')) { continue; }
-            // Atom: full k-mer (high specificity, HiFi) or middle s-mer
-            // (error-tolerant, ONT default).  k≤32 keeps the base-4 fit in u64.
-            let atom: &[u8] = if kmer_atom() && k <= 32 { kmer } else { &kmer[t..t + s] };
-            out.push(SyncmerLight { pos: i as u32, value: atom_value(atom) });
+            // Hierarchy atom = the full k-mer (k ≤ 32 keeps the base-4 fit in u64).
+            out.push(SyncmerLight { pos: i as u32, value: atom_value(kmer) });
         }
     }
     out

@@ -1,40 +1,8 @@
-#![allow(unused_imports, dead_code)]
-use crate::config::*;
-use crate::syncmer::*;
-use crate::lcp::*;
-use crate::index::*;
-use crate::fastq::*;
-use crate::align::*;
-use crate::chain::*;
-use crate::map::*;
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
-use std::fs::File;
-use std::time::Instant;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
-use std::cell::RefCell;
-use std::collections::HashSet;
-use flate2::read::MultiGzDecoder;
-use rayon::prelude::*;
 
-/// Base-4 encode the reverse-complement of `atom` without allocating.
-#[inline]
-pub(crate) fn encode_revcomp(atom: &[u8]) -> u64 {
-    let mut h = 0u64;
-    for &b in atom.iter().rev() {
-        let comp = match b.to_ascii_uppercase() {
-            b'A' => 3, b'C' => 2, b'G' => 1, b'T' => 0, _ => 0, // complement, base-4
-        };
-        h = h * 4 + comp;
-    }
-    h
-}
-
-/// The atom value for a window, honoring the canonical flag.
+/// The atom value for a window: base-4 encoding of the (forward) k-mer.
 #[inline]
 pub(crate) fn atom_value(atom: &[u8]) -> u64 {
-    let f = encode_smer(atom);
-    if canon_atom() { f.min(encode_revcomp(atom)) } else { f }
+    encode_smer(atom)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -171,18 +139,6 @@ pub(crate) fn level_domain(level_0idx: usize) -> u64 {
     LEVEL_DOMAINS.get(level_0idx).copied().unwrap_or_else(||
         LEVEL_DOMAINS[7].wrapping_add(
             (level_0idx as u64).wrapping_mul(0x6c62272e07bb0142)))
-}
-
-/// Hash a block's values at the given 0-indexed level.
-#[inline]
-pub(crate) fn block_hash_for_level(values: &[u64], level_0idx: usize) -> u64 {
-    block_hash_with_domain(values, level_domain(level_0idx))
-}
-
-// Backward-compatible aliases used by the demo/stats display code.
-
-pub(crate) fn block_hash_with_domain(values: &[u64], domain: u64) -> u64 {
-    block_hash_iter_domain(values.len(), values.iter().copied(), domain)
 }
 
 /// Hash `len` block values (yielded by `vals`) into the given domain. Taking an
