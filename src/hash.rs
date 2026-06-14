@@ -164,11 +164,12 @@ pub(crate) fn block_hash_iter_domain(len: usize, vals: impl Iterator<Item = u64>
     h
 }
 
-/// Hash a block whose values are `src[i]` for each `i` in `indices`, at the given
-/// 0-indexed level — without gathering them into a temporary `Vec` first.
+/// Hash a block at the given 0-indexed level. A block always covers a *contiguous*
+/// run of units (the LCP rules only ever emit `lo..=hi` ranges), so its values are
+/// exactly the slice `vals` — no gather needed.
 #[inline]
-pub(crate) fn block_hash_indices_for_level(indices: &[usize], src: &[u64], level_0idx: usize) -> u64 {
-    block_hash_iter_domain(indices.len(), indices.iter().map(|&i| src[i]), level_domain(level_0idx))
+pub(crate) fn block_hash_for_level(vals: &[u64], level_0idx: usize) -> u64 {
+    block_hash_iter_domain(vals.len(), vals.iter().copied(), level_domain(level_0idx))
 }
 
 

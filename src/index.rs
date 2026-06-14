@@ -89,23 +89,26 @@ impl GIndex {
     }
 }
 
-/// Read all chromosomes from a FASTA file (plain or .gz) into memory.
-pub(crate) fn read_fasta_chrs(path: &str) -> Vec<(String, Vec<u8>)> {
+/// Stream a FASTA file (plain or .gz), invoking `f(name, seq)` once per
+/// chromosome as it is parsed. Unlike loading the whole genome up front, this
+/// lets the caller process and **drop each sequence before the next is read**,
+/// so peak resident genome is bounded by what is in flight rather than the whole
+/// file. Chromosomes are delivered in file order.
+pub(crate) fn for_each_fasta_chr(path: &str, mut f: impl FnMut(String, Vec<u8>)) {
     let file = File::open(path).unwrap_or_else(|e| panic!("Cannot open {path}: {e}"));
     let reader: Box<dyn BufRead> = if path.ends_with(".gz") {
         Box::new(BufReader::with_capacity(1 << 20, MultiGzDecoder::new(file)))
     } else {
         Box::new(BufReader::with_capacity(1 << 20, file))
     };
-    let mut chrs: Vec<(String, Vec<u8>)> = Vec::new();
     let mut name = String::new();
-    let mut seq: Vec<u8> = Vec::with_capacity(1 << 28);
+    let mut seq: Vec<u8> = Vec::new();
     for line in reader.lines() {
         let line = line.expect("read error");
         let bytes = line.trim_end().as_bytes();
         if bytes.first() == Some(&b'>') {
             if !seq.is_empty() {
-                chrs.push((name.clone(), std::mem::take(&mut seq)));
+                f(std::mem::take(&mut name), std::mem::take(&mut seq));
             }
             name = std::str::from_utf8(&bytes[1..])
                 .unwrap_or("?").split_whitespace().next().unwrap_or("?")
@@ -114,8 +117,7 @@ pub(crate) fn read_fasta_chrs(path: &str) -> Vec<(String, Vec<u8>)> {
             seq.extend(bytes.iter().map(|b| b.to_ascii_uppercase()));
         }
     }
-    if !seq.is_empty() { chrs.push((name, seq)); }
-    chrs
+    if !seq.is_empty() { f(name, seq); }
 }
 
 /// Extract entries for all N levels from one chromosome (N-split on 'N' runs).
@@ -156,38 +158,69 @@ pub(crate) fn chr_to_entries_n(chr_id: u8, seq: &[u8], k: usize, s: usize, t: us
 pub(crate) fn build_index(genome_path: &str, k: usize, s: usize, t: usize, max_levels: usize,
                mode: SeedMode) -> (GIndex, std::time::Duration)
 {
+    use std::sync::mpsc::sync_channel;
+    use std::sync::Mutex;
+
     let t0 = Instant::now();
     let min_level = min_lvl();
 
-    print!("    reading sequences ... ");
-    std::io::stdout().flush().ok();
-    let chrs = read_fasta_chrs(genome_path);
-    println!("{} chromosomes", chrs.len());
-
-    let chr_names: Vec<String> = chrs.iter().map(|(n, _)| n.clone()).collect();
-
-    print!("    extracting levels ≥ {min_level} of {max_levels} (parallel) ... ");
+    print!("    streaming sequences + extracting levels ≥ {min_level} of {max_levels} (parallel) ... ");
     std::io::stdout().flush().ok();
 
-    // Parallel per-chromosome extraction
-    let all: Vec<Vec<Vec<(u64, u8, u32)>>> = chrs.par_iter().enumerate()
-        .map(|(chr_id, (_, seq))| chr_to_entries_n(chr_id as u8, seq, k, s, t, max_levels, mode))
-        .collect();
+    // Per-level entry accumulators, written by all workers (entries land in
+    // arbitrary completion order and are sorted afterwards). Each is a separate
+    // mutex so workers appending to different levels never contend.
+    let merged: Vec<Mutex<Vec<(u64, u8, u32)>>> =
+        (0..max_levels).map(|_| Mutex::new(Vec::new())).collect();
 
-    // Merge across chromosomes
-    let mut merged: Vec<Vec<(u64, u8, u32)>> = vec![Vec::new(); max_levels];
-    for chr_levels in all {
-        for (li, entries) in chr_levels.into_iter().enumerate() {
-            if li < merged.len() { merged[li].extend(entries); }
-        }
-    }
+    // A single reader thread parses the FASTA and feeds (chr_id, seq) into a
+    // bounded channel; a rayon worker pool drains it, extracts entries, then
+    // drops each sequence. The bound (2) caps *queued* sequences on top of the
+    // ones being processed (≈ one per worker), so peak resident genome is a
+    // handful of chromosomes rather than the whole file. Extraction dwarfs
+    // gzip decode, so the reader stays comfortably ahead at this small depth.
+    let (tx, rx) = sync_channel::<(u8, Vec<u8>)>(2);
+
+    let chr_names: Vec<String> = std::thread::scope(|scope| {
+        // Producer: assign chr_id in file order so it matches chr_names.
+        let producer = scope.spawn(move || {
+            let mut names: Vec<String> = Vec::new();
+            let mut chr_id: usize = 0;
+            for_each_fasta_chr(genome_path, |name, seq| {
+                names.push(name);
+                tx.send((chr_id as u8, seq)).expect("index build worker hung up");
+                chr_id += 1;
+            });
+            names // tx dropped here → channel closes → consumers finish
+        });
+
+        // Consumers: one chromosome per task, sequence freed at task end.
+        rx.into_iter().par_bridge().for_each(|(chr_id, seq)| {
+            let per_level = chr_to_entries_n(chr_id, &seq, k, s, t, max_levels, mode);
+            drop(seq);
+            for (li, entries) in per_level.into_iter().enumerate() {
+                if li < merged.len() && !entries.is_empty() {
+                    merged[li].lock().unwrap().extend(entries);
+                }
+            }
+        });
+
+        producer.join().unwrap()
+    });
+    println!("{} chromosomes", chr_names.len());
+
+    let mut merged: Vec<Vec<(u64, u8, u32)>> =
+        merged.into_iter().map(|m| m.into_inner().unwrap()).collect();
     // Drop trailing empty levels (can happen for short genomes / large k)
     while merged.last().map_or(false, |v| v.is_empty()) { merged.pop(); }
 
     print!("    sorting L1-L{max_levels} ... ");
     std::io::stdout().flush().ok();
+    // Full-tuple key: entries arrive in nondeterministic worker order, so sort
+    // on (hash, chr, pos) — not hash alone — to keep the built index
+    // reproducible regardless of thread scheduling.
     for level in &mut merged {
-        level.sort_unstable_by_key(|e| e.0);
+        level.sort_unstable();
     }
     println!("done");
 

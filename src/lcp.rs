@@ -2,9 +2,24 @@ use crate::config::*;
 use crate::hash::*;
 use crate::syncmer::*;
 
-#[derive(Debug)]
+/// One LCP block: the contiguous half-open range of unit indices `start..end`.
+///
+/// Every rule in `locally_consistent_parsing` emits a contiguous `lo..=hi` range,
+/// so a block never needs an explicit index list — storing it as two `u32`s
+/// instead of a `Vec<usize>` removes millions of tiny heap allocations at genome
+/// scale (the build's dominant per-thread scratch) and is also faster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Block {
-    pub(crate) indices: Vec<usize>,
+    pub(crate) start: u32,
+    pub(crate) end:   u32,   // exclusive
+}
+
+impl Block {
+    #[inline] pub(crate) fn range(&self) -> std::ops::Range<usize> {
+        self.start as usize .. self.end as usize
+    }
+    #[inline] pub(crate) fn first(&self) -> usize { self.start as usize }
+    #[inline] pub(crate) fn last(&self)  -> usize { self.end as usize - 1 }
 }
 
 /// Cole–Vishkin deterministic coin-tossing: reduce a *proper* colouring (adjacent
@@ -75,22 +90,24 @@ fn dct_three_coloring(vals: &[u64]) -> Vec<u8> {
 /// a local maximum and every position is covered by some min/max triplet — the
 /// repetition (rule 3) and monotone (rule 4) cases are unreachable on a 3-colour
 /// proper sequence.  Every emitted block therefore spans ≤ 3 indices; no chunking.
-pub(crate) fn split_monotone_run(run: &[usize], values: &[u64]) -> Vec<Vec<usize>> {
+/// Returns contiguous half-open index ranges `start..end` (in the same index space
+/// as `run`); the run itself is contiguous, so every triplet is too.
+pub(crate) fn split_monotone_run(run: &[usize], values: &[u64]) -> Vec<(u32, u32)> {
     let m = run.len();
-    if m <= 3 { return vec![run.to_vec()]; }
+    if m <= 3 { return vec![(run[0] as u32, run[m - 1] as u32 + 1)]; }
 
     // Colour the run by its *content* (the values) so read and reference split
     // identically wherever the same run occurs.
     let vals: Vec<u64> = run.iter().map(|&i| values[i]).collect();
     let col: Vec<u64> = dct_three_coloring(&vals).iter().map(|&c| c as u64).collect();
 
-    let triplet = |i: usize| {
+    let triplet = |i: usize| -> (u32, u32) {
         let lo = i.saturating_sub(1);
         let hi = (i + 1).min(m - 1);
-        run[lo..=hi].to_vec()
+        (run[lo] as u32, run[hi] as u32 + 1)
     };
 
-    let mut out: Vec<Vec<usize>> = Vec::new();
+    let mut out: Vec<(u32, u32)> = Vec::new();
     // Rule 1 — local-minimum triplet.
     for i in 0..m {
         if is_local_min(&col, i) { out.push(triplet(i)); }
@@ -122,7 +139,7 @@ pub(crate) fn is_local_max(v: &[u64], i: usize) -> bool {
 pub(crate) fn locally_consistent_parsing(values: &[u64]) -> Vec<Block> {
     let n = values.len();
     if n == 0 { return vec![]; }
-    if n == 1 { return vec![Block { indices: vec![0] }]; }
+    if n == 1 { return vec![Block { start: 0, end: 1 }]; }
 
     // Vec<bool> instead of HashSet — better cache behaviour at genome scale
     let is_min: Vec<bool> = (0..n).map(|i| is_local_min(values, i)).collect();
@@ -131,38 +148,36 @@ pub(crate) fn locally_consistent_parsing(values: &[u64]) -> Vec<Block> {
     let mut assigned = vec![false; n];
     let mut blocks: Vec<Block> = Vec::new();
 
-    // Inclusive commit: all positions including already-assigned (all rules)
-    macro_rules! commit_incl {
-        ($idxs:expr) => {{
-            let all: Vec<usize> = $idxs.into_iter().filter(|&i| i < n).collect();
-            if all.iter().any(|&i| !assigned[i]) {
-                for &i in &all { assigned[i] = true; }
-                blocks.push(Block { indices: all });
+    // Commit the contiguous inclusive range `lo..=hi` (clamped to the sequence) as
+    // one block, but only if it contributes at least one not-yet-assigned position
+    // (shared boundaries between adjacent blocks are intentional intersections).
+    macro_rules! commit_range {
+        ($lo:expr, $hi:expr) => {{
+            let lo = $lo;
+            let hi = ($hi).min(n - 1);
+            if (lo..=hi).any(|i| !assigned[i]) {
+                for i in lo..=hi { assigned[i] = true; }
+                blocks.push(Block { start: lo as u32, end: hi as u32 + 1 });
             }
         }};
     }
 
-    // Rule 1 — local-minimum block: always full triplet {i-1, i, i+1}
-    // Uses commit_incl so adjacent minima each get their full triplet
-    // (shared boundary position appears in both — intentional intersection).
+    // Rule 1 — local-minimum block: always full triplet {i-1, i, i+1}.
+    // Adjacent minima each get their full triplet (shared boundary appears in
+    // both — intentional intersection).
     for i in 0..n {
         if is_min[i] {
-            let lo = i.saturating_sub(1);
-            let hi = (i + 1).min(n - 1);
-            commit_incl!(lo..=hi);
+            commit_range!(i.saturating_sub(1), i + 1);
         }
     }
 
-    // Rule 2 — local-maximum block (no adjacent local minimum)
-    // Also commit_incl so {i-1, i, i+1} always present.
+    // Rule 2 — local-maximum block (no adjacent local minimum), {i-1, i, i+1}.
     for i in 0..n {
         if is_max[i] {
             let l_is_min = i > 0     && is_min[i - 1];
             let r_is_min = i + 1 < n && is_min[i + 1];
             if !l_is_min && !r_is_min {
-                let lo = i.saturating_sub(1);
-                let hi = (i + 1).min(n - 1);
-                commit_incl!(lo..=hi);
+                commit_range!(i.saturating_sub(1), i + 1);
             }
         }
     }
@@ -174,9 +189,8 @@ pub(crate) fn locally_consistent_parsing(values: &[u64]) -> Vec<Block> {
             let mut j = i + 1;
             while j < n && values[j] == values[i] { j += 1; }
             if j - i >= 2 {
-                let lo = i.saturating_sub(1);
-                let hi = j.min(n - 1); // j is one past the run; j is the next syncmer
-                commit_incl!(lo..=hi);
+                // j is one past the run; the macro clamps it to the next syncmer.
+                commit_range!(i.saturating_sub(1), j);
             }
             i = j;
         }
@@ -197,8 +211,8 @@ pub(crate) fn locally_consistent_parsing(values: &[u64]) -> Vec<Block> {
                 // Split long monotone runs into ≤3-unit blocks via DCT so they
                 // aren't one big featureless block (deterministic & locally
                 // consistent → genome and read split identically).
-                for sub in split_monotone_run(&run, values) {
-                    commit_incl!(sub);
+                for (s, e) in split_monotone_run(&run, values) {
+                    commit_range!(s as usize, e as usize - 1);
                 }
             }
         }
@@ -213,7 +227,7 @@ pub(crate) fn locally_consistent_parsing(values: &[u64]) -> Vec<Block> {
         );
     }
 
-    blocks.sort_by_key(|b| b.indices[0]);
+    blocks.sort_by_key(|b| b.start);
     blocks
 }
 
@@ -227,6 +241,12 @@ pub(crate) fn locally_consistent_parsing(values: &[u64]) -> Vec<Block> {
 pub(crate) fn extract_all_levels(seq: &[u8], k: usize, s: usize, t: usize, max_levels: usize,
                       mode: SeedMode) -> Vec<Vec<(u64, u32)>>
 {
+    // Only levels ≥ min_level are stored in the index. Lower levels must still be
+    // *computed* (each level is parsed from the one below), but their (hash, pos)
+    // entry tuples are never emitted — building them only to discard them wastes
+    // the build's largest entry vec (L1 has the most blocks).
+    let min_level = min_lvl();
+
     let syncmers = select_seeds_light(seq, k, s, t, mode);
     if syncmers.is_empty() { return vec![]; }
 
@@ -235,16 +255,27 @@ pub(crate) fn extract_all_levels(seq: &[u8], k: usize, s: usize, t: usize, max_l
 
     let mut cur_hashes: Vec<u64> = Vec::with_capacity(l1_raw.len());
     let mut cur_pos:    Vec<u32> = Vec::with_capacity(l1_raw.len());
-    let mut first_out: Vec<(u64, u32)> = Vec::with_capacity(l1_raw.len());
+    let store_l1 = 1 >= min_level;
+    let mut first_out: Vec<(u64, u32)> =
+        if store_l1 { Vec::with_capacity(l1_raw.len()) } else { Vec::new() };
 
     for blk in &l1_raw {
-        let h   = block_hash_indices_for_level(&blk.indices, &smer_vals, 0);
-        let pos = syncmers[blk.indices[0]].pos;
+        let h   = block_hash_for_level(&smer_vals[blk.range()], 0);
+        let pos = syncmers[blk.first()].pos;
         cur_hashes.push(h);
         cur_pos.push(pos);
-        first_out.push((h, pos));
+        if store_l1 { first_out.push((h, pos)); }
     }
-    // all[0] = L1 blocks, all[1] = L2 blocks, …
+    // The syncmer atoms, their s-mer values and the L1 block index lists are dead
+    // once the L1 block hashes/positions exist. These are the heaviest per-segment
+    // allocations (millions of tiny `Vec<usize>` in `l1_raw`); free them before
+    // building L2…L6 so they don't stay resident through the upper levels and, more
+    // importantly, don't stack up across worker threads into the build's peak.
+    drop(l1_raw);
+    drop(smer_vals);
+    drop(syncmers);
+
+    // all[0] = L1 blocks, all[1] = L2 blocks, … (empty for levels below min_level).
     let mut all: Vec<Vec<(u64, u32)>> = vec![first_out];
 
     for level_1idx in 2..=max_levels {
@@ -254,14 +285,16 @@ pub(crate) fn extract_all_levels(seq: &[u8], k: usize, s: usize, t: usize, max_l
 
         let mut next_hashes = Vec::with_capacity(next_raw.len());
         let mut next_pos    = Vec::with_capacity(next_raw.len());
-        let mut level_out   = Vec::with_capacity(next_raw.len());
+        let store = level_1idx >= min_level;
+        let mut level_out: Vec<(u64, u32)> =
+            if store { Vec::with_capacity(next_raw.len()) } else { Vec::new() };
 
         for blk in &next_raw {
-            let h   = block_hash_indices_for_level(&blk.indices, &cur_hashes, level_1idx - 1);
-            let pos = cur_pos[blk.indices[0]];
+            let h   = block_hash_for_level(&cur_hashes[blk.range()], level_1idx - 1);
+            let pos = cur_pos[blk.first()];
             next_hashes.push(h);
             next_pos.push(pos);
-            level_out.push((h, pos));
+            if store { level_out.push((h, pos)); }
         }
 
         all.push(level_out);
@@ -316,14 +349,14 @@ pub(crate) fn extract_hier_blocks_n(seq: &[u8], k: usize, s: usize, t: usize, nu
     // Each syncmer carries mass 1.  A syncmer shared by `m` L1 blocks splits its
     // mass 1/m across them.  A block's mass = sum of its syncmers' shares.
     let mut sync_membership = vec![0u32; syncmers.len()];
-    for blk in &l1_raw { for &i in &blk.indices { sync_membership[i] += 1; } }
+    for blk in &l1_raw { for i in blk.range() { sync_membership[i] += 1; } }
 
     let l1: Vec<HierNode> = l1_raw.iter().map(|blk| {
-        let h   = block_hash_indices_for_level(&blk.indices, &smer_vals, 0);
-        let pos = syncmers[blk.indices[0]].pos;
-        let end = syncmers[*blk.indices.last().unwrap()].pos + k as u32;
-        let mass: f32 = blk.indices.iter()
-            .map(|&i| 1.0 / sync_membership[i] as f32).sum();
+        let h   = block_hash_for_level(&smer_vals[blk.range()], 0);
+        let pos = syncmers[blk.first()].pos;
+        let end = syncmers[blk.last()].pos + k as u32;
+        let mass: f32 = blk.range()
+            .map(|i| 1.0 / sync_membership[i] as f32).sum();
         HierNode { level: 1, hash: h, pos, end, mass, children: Vec::new() }
     }).collect();
 
@@ -350,16 +383,16 @@ pub(crate) fn extract_hier_blocks_n(seq: &[u8], k: usize, s: usize, t: usize, nu
 
             // Membership: how many parent blocks each child block belongs to.
             let mut child_membership = vec![0u32; cur_hashes.len()];
-            for blk in &next_raw { for &i in &blk.indices { child_membership[i] += 1; } }
+            for blk in &next_raw { for i in blk.range() { child_membership[i] += 1; } }
 
             let new_level: Vec<HierNode> = next_raw.iter().map(|blk| {
-                let h        = block_hash_indices_for_level(&blk.indices, &cur_hashes, level_1idx - 1);
-                let pos      = cur_pos[blk.indices[0]];
-                let end      = cur_end[*blk.indices.last().unwrap()];
+                let h        = block_hash_for_level(&cur_hashes[blk.range()], level_1idx - 1);
+                let pos      = cur_pos[blk.first()];
+                let end      = cur_end[blk.last()];
                 // Parent mass = sum of each child's mass / (#parents sharing that child).
-                let mass: f32 = blk.indices.iter()
-                    .map(|&i| cur_mass[i] / child_membership[i] as f32).sum();
-                let children: Vec<u32> = blk.indices.iter().map(|&i| i as u32).collect();
+                let mass: f32 = blk.range()
+                    .map(|i| cur_mass[i] / child_membership[i] as f32).sum();
+                let children: Vec<u32> = (blk.start..blk.end).collect();
                 HierNode { level: level_1idx, hash: h, pos, end, mass, children }
             }).collect();
 
@@ -441,15 +474,15 @@ mod dct_tests {
             // Determinism.
             assert_eq!(blocks, split_monotone_run(&run, &values));
 
-            // Size bound + consecutive indices within each block.
-            for b in &blocks {
-                assert!(b.len() >= 1 && b.len() <= 3, "block size {} (m={m}): {b:?}", b.len());
-                for w in b.windows(2) { assert_eq!(w[1], w[0] + 1); }
+            // Size bound: each block is a contiguous range of 1..=3 indices.
+            for &(s, e) in &blocks {
+                let len = e - s;
+                assert!((1..=3).contains(&len), "block size {len} (m={m}): {s}..{e}");
             }
 
             // Full coverage: the union of all blocks must hit every run index.
             let mut covered = vec![false; m];
-            for b in &blocks { for &i in b { covered[i] = true; } }
+            for &(s, e) in &blocks { for i in s..e { covered[i as usize] = true; } }
             assert!(covered.iter().all(|&c| c),
                     "uncovered index (m={m}, decreasing={decreasing})");
         }
