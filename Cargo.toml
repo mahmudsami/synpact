@@ -1,12 +1,11 @@
 [package]
-name = "syncmer-hifi"
+name = "synpact"
 version = "0.1.0"
 edition = "2021"
 description = "Hierarchical locally-consistent syncmer mapper for PacBio HiFi reads"
-license = "MIT"
 
 [[bin]]
-name = "syncmer-hifi"
+name = "synpact"
 path = "src/main.rs"
 
 [dependencies]

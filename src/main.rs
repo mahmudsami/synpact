@@ -1,4 +1,4 @@
-//! syncmer-hifi — hierarchical syncmer-LCP read mapper for PacBio HiFi.
+//! synpact — hierarchical syncmer-LCP read mapper for PacBio HiFi.
 //!
 //! Pipeline (see README for the full method description):
 //!   reads → open syncmers → locally-consistent parsing (LCP) into a 6-level
@@ -25,14 +25,14 @@ use std::io::Write;
 use std::time::Instant;
 
 const USAGE: &str = "\
-syncmer-hifi — hierarchical syncmer-LCP mapper for PacBio HiFi reads
+synpact — hierarchical syncmer-LCP mapper for PacBio HiFi reads
 
 USAGE:
   Build an index from a reference FASTA:
-    syncmer-hifi --build-index <genome.fa[.gz]> <out.idx> [options]
+    synpact --build-index <genome.fa[.gz]> <out.idx> [options]
 
   Map HiFi reads against a prebuilt index (or a FASTA):
-    syncmer-hifi --map <reads.fq[.gz]> <index.idx|genome.fa[.gz]> -o <out.paf> [options]
+    synpact --map <reads.fq[.gz]> <index.idx|genome.fa[.gz]> -o <out.paf> [options]
 
 OPTIONS:
   --k N            k-mer length          (default 19, must be ≤ 32)
@@ -105,7 +105,7 @@ fn main() {
             .expect("--build-index requires a genome path");
         let idx_path = args[bi_pos + 2..].iter()
             .find(|a| !a.starts_with('-'))
-            .map(|s| s.as_str()).unwrap_or("syncmer-hifi.idx");
+            .map(|s| s.as_str()).unwrap_or("synpact.idx");
         let nthreads = rayon::current_num_threads();
         println!("\n  Building L{MAX_LEVELS} index (levels ≥ {})  k={k}  s={s}  threads={nthreads}", min_lvl());
         println!("  genome : {genome_path}");
