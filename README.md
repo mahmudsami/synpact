@@ -1,90 +1,95 @@
-# syncmer-hifi
+# Synpact
 
 A long-read mapper for **PacBio HiFi** reads built on a hierarchy of
 **locally-consistent syncmer blocks**. Instead of seed-and-extend, it places a
 read by voting matches of multi-scale blocks that are reproducible between the
 read and the reference even in the presence of sequencing errors.
 
-On simulated T2T-CHM13 HiFi reads (100 k × 24 kb, 0.1 % error) it reaches
-**99.59 % placement accuracy / 99.97 % precision with zero wrong-chromosome
-calls**, exceeding `minimap2 -x map-hifi` precision while running CIGAR-free
-mapping at **~2,400 reads/s** on 8 threads. Because the default index stores only
-the coarse blocks it actually uses (levels ≥ 3), the T2T-CHM13 index is just
-**~560 MB** — roughly an order of magnitude smaller than the full hierarchy.
-
----
+The output is standard PAF: one placement (chromosome, position, strand, MAPQ)
+per read, no base-level alignment.
 
 ## How it works
 
-The method turns each sequence into a **multi-level hierarchy of blocks** and
-maps by voting on block matches. Six steps:
+The pipeline turns both the reference and each read into the same kind of
+multi-level block hierarchy, then places a read by matching its blocks against
+an index of the reference's blocks.
 
 ### 1. Seeds — open syncmers
+
 A k-mer (default `k = 19`) is selected as a *syncmer* iff the minimum-hash
-s-mer (default `s = 10`) inside it lies at the central offset `t = (k−s)/2`.
-This yields a sparse, reproducible ~`1/(k−s+1)` = 1/10 subset of positions.
-Because selection is *local*, the read and the reference pick the **same**
-positions, and a single base error only perturbs the few k-mers spanning it.
+s-mer (default `s = 10`) inside it sits at the middle offset `t = (k − s) / 2`.
+The s-mer hashes come from a forward-only rolling DNA hash, and the minimum over
+each `(k − s + 1)`-wide window is tracked with a monotone deque, so selection is
+linear in sequence length. This open-syncmer rule keeps roughly one seed every
+`k − s + 1` bases and — crucially — is *locally consistent*: a sequencing error
+only disturbs the seeds whose window it falls in, leaving the rest identical
+between read and reference.
 
-A fast forward-only rotation-XOR hash (no external dependency) drives selection.
-The mapper processes the read and its reverse complement as two independent
-passes, so exactly one pass lights up — that determines strand.
+Each selected syncmer carries a **value**: the base-4 encoding of its full
+k-mer (`k ≤ 32` keeps it in a `u64`). Using the whole k-mer this way is what
+makes placement specific at HiFi error rates.
 
-### 2. Locally-Consistent Parsing (LCP) → blocks
+### 2. Locally-consistent parsing (LCP) into L1 blocks
+
 The stream of syncmer values is parsed into non-overlapping **L1 blocks** by
-four content-only rules (local minimum, isolated local maximum, repetition run,
-monotone run). Local minima are robust to mutation, so two copies of a region
-parse into the *same* blocks. Long monotone runs are split deterministically by
-**Cole–Vishkin deterministic coin-tossing**: the run (repetition-free, since
-strictly monotone) is reduced to a proper 3-colouring (iterated `coin' = 2·π + z`
-down to ≤6 colours, then collapsed to {0,1,2}), and then parsed by the *same*
-local-minimum and local-maximum rules used above. Over a 3-colour alphabet no two
-slope points are adjacent, so every position is covered by a min/max triplet:
-this provably yields blocks of size ≤3 with a bounded dependence window (locally
-consistent), carrying positional signal without any heuristic length cap.
+a set of deterministic, locally-consistent rules (`locally_consistent_parsing`):
 
-### 3. Recursive hierarchy (L1 … L6)
-LCP is applied again to the sequence of L1 block hashes to form L2 blocks, then
-L3 … up to **6 levels**. Each level’s blocks are ~2.3× longer than the level
-below (measured spans: L1 ≈ 40 bp → L6 ≈ 2.5 kb). A long read is anchored by a
-few high-level blocks if they are unique, and falls back to finer levels where
-they are not.
+- a triplet around every **local minimum**,
+- a triplet around every **local maximum** with no adjacent minimum,
+- **repetition runs** (consecutive equal values) plus their neighbours,
+- **monotone runs**, which are further split into ≤ 3-unit blocks by Cole–Vishkin
+  deterministic coin-tossing (`dct_three_coloring`) so a long ramp doesn't become
+  one giant block.
 
-### 4. Index
-Each block is a 64-bit hash. The reference index stores, per level, three
-parallel arrays `(hash, chr, pos)` sorted by hash (struct-of-arrays: 13 B/entry,
-cache-friendly binary search). The **atom** fed into the hierarchy is the full
-k-mer (not the s-mer) — at HiFi error rates this is rarely corrupted and gives
-~97.5 % genome-unique L1 blocks, the key to minimap2-level specificity.
+Each rule depends only on a bounded window of values, so the same content always
+parses into the same blocks wherever it occurs — the read and the reference cut
+at the same places. Adjacent blocks intentionally share boundary units.
 
-### 5. Anchoring + voting
-For each read, blocks are looked up; over-frequent blocks are skipped and finer
-children tried. Each anchor’s weight is its **conservation-of-mass** score:
-every syncmer carries mass 1, a block’s mass is the sum of its units’ masses, and
-a unit shared by *m* blocks contributes 1/m to each. This automatically
-down-weights repetitive blocks without any explicit repeat penalty.
+### 3. Canonical block hashing and the level hierarchy
 
-The read’s locus is then chosen by **diagonal voting** (default): anchors are
-binned by diagonal (`r_pos − q_pos`) and the heaviest cluster wins, with the gap
-to the next-best locus setting MAPQ. Voting is slightly more accurate than a
-colinear chain-DP on contested (paralogous) reads and just as fast; pass
-`--chaining` to use the gap-penalised chain-DP instead.
+Each block is reduced to a single 64-bit **block hash** over its ordered s-mer
+values (`block_hash_for_level`). The hash folds in block length and a per-level
+domain constant so blocks of different sizes or different levels occupy disjoint
+hash spaces, and applies a SplitMix64 avalanche step per value so reordering
+changes the hash. Two blocks with identical content anywhere in the genome get
+the same hash, making it a canonical block identifier.
 
-By default only blocks at **level ≥ 3** (≈ L3–L6, spans ≳ 150 bp) are indexed and
-allowed to anchor a read (`--min-level`, default 3). The short L0–L2 blocks match
-in many places across segmental duplications and paralogs, and at HiFi error rates
-they add ambiguity rather than signal: dropping them raises accuracy, eliminates
-wrong-chromosome calls, runs ~50 % faster, and shrinks the index ~10×. Build with
-`--index-min-level 0` and map with `--min-level 0` for noisier (> 1 % error) data,
-where the finer levels’ sensitivity is needed.
+The L1 block hashes are then themselves fed back through the *same* LCP rules to
+form **L2 blocks**, and so on up to **L6** (`MAX_LEVELS = 6`). Higher levels
+cover progressively longer spans and are more unique, so they place a read
+faster and with less paralog ambiguity; lower levels are the fallback when a
+coarse block isn't found.
 
-### 6. Optional CIGAR (`--cigar`)
-Base-level alignment reuses the chain as a scaffold: anchor spans are emitted
-directly and only the short inter-anchor gaps are aligned, with an **affine-gap**
-banded DP. This is ~5–8× faster than aligning the whole read and produces clean,
-consolidated indel runs.
+### 4. Conservation of mass
 
----
+Every syncmer carries **mass 1**. A unit shared by `m` blocks contributes `1/m`
+to each, and a block's mass is the sum of its units' shares, so total mass is
+conserved across every level. This mass becomes the anchor weight at mapping
+time, giving larger / more-supported blocks proportionally more vote.
+
+### 5. Index
+
+For each stored level the reference's `(block hash, chromosome, position)` tuples
+are sorted by hash into a struct-of-arrays layout and binary-searched at query
+time. By default only levels ≥ `--min-level` (3) are stored — the coarse, unique
+levels the mapper actually anchors from — which keeps the index compact. The
+index is self-describing: it records `k`, `s`, `t`, and the seed mode, so mapping
+needs no parameter flags.
+
+### 6. Mapping a read
+
+A read is turned into its own block hierarchy, on both the forward and
+reverse-complement strands. Starting from the top level, each block is looked up
+in the index; on a miss or a too-repetitive hit it recurses into its finer
+children (`emit_anchors`). Every hit becomes a mass-weighted **anchor**
+`(query pos, reference pos)`.
+
+Placement is by **diagonal voting** (`vote_locus`): anchors are sorted by
+diagonal (`r_pos − q_pos`) and a sliding window accumulates anchor weight; the
+heaviest window is the locus. **MAPQ** is `(best − second) × 60 / best`, where
+`second` is the heaviest window at a genuinely different locus — so a read with
+one clear placement gets a high MAPQ and one with two equally-good loci gets a
+low one.
 
 ## Build
 
@@ -92,85 +97,55 @@ Requires a Rust toolchain (`cargo`).
 
 ```sh
 cargo build --release
-# binary: target/release/syncmer-hifi
+# binary: target/release/synpact
 ```
 
 ## Usage
 
 ### 1. Build an index from a reference FASTA (once)
 ```sh
-syncmer-hifi --build-index genome.fa.gz genome.idx --threads 8
+synpact --build-index genome.fa.gz genome.idx --threads 8
 ```
-Default preset is `k=19 s=10`, indexing only the coarse blocks the default mapper
-uses (levels ≥ 3) — the T2T-CHM13 index is ~560 MB and builds in well under a
-minute. The index records its parameters, so mapping needs no flags. To also
-support mapping noisy (> 1 % error) reads at `--min-level 0`, build the full
-hierarchy with `--index-min-level 0`.
+The reference FASTA may be plain or gzip-compressed. The index records its
+parameters, so mapping against it needs no flags. The FASTA is streamed
+chromosome-by-chromosome and processed in parallel, so peak memory stays bounded
+by the chromosomes in flight rather than the whole genome.
 
 ### 2. Map HiFi reads → PAF
 ```sh
-syncmer-hifi --map reads.fq.gz genome.idx -o out.paf --threads 8
+synpact --map reads.fq.gz genome.idx -o out.paf --threads 8
 ```
 
-### 3. Map with base-level CIGAR (for variant calling)
-The CIGAR path needs the reference sequence; pass it with `--ref`:
+You can also map directly against a FASTA (it is indexed in memory first):
 ```sh
-syncmer-hifi --map reads.fq.gz genome.idx --ref genome.fa.gz --cigar -o out.paf --threads 8
+synpact --map reads.fq.gz genome.fa.gz -o out.paf
 ```
 
 ### Options
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--k N` | 19 | k-mer length |
-| `--s N` | 10 | syncmer s-mer length (density = 1/(k−s+1)) |
+| `--k N` | 19 | k-mer (syncmer) length; must be ≤ 32 and > `--s` |
+| `--s N` | 10 | syncmer s-mer length (density ≈ 1/(k−s+1)) |
 | `--threads N` | all cores | worker threads |
-| `--cigar [BAND]` | off | emit `cg:Z:` CIGAR (needs reference); `BAND` = half-band in bp, auto if omitted |
-| `--ref <fa>` | — | reference FASTA for `--cigar` against a `.idx` |
-| `--max-occ N` | 500 | max genomic occurrences per L2+ block |
-| `--min-level N` | 3 | lowest block level allowed to anchor a read; default 3 is tuned for HiFi, use 0 for >1 % error reads |
-| `--index-min-level N` | 3 | *(build only)* lowest block level to index; match `--min-level`. Use 0 to support `--min-level 0` mapping |
-| `--vote` | on | place reads by diagonal voting (default selector) |
-| `--chaining` | off | place reads by colinear chain-DP instead of voting |
+| `--min-level N` | 3 | lowest block level both stored in the index and used to anchor reads (one unified floor) |
+| `--max-occ N` | 10000 | max genomic occurrences for an L2/L3 block before it is skipped as too-repetitive; higher levels scale this down, the L1 cap scales it to 2/5 |
 | `--batch-mb N` | 256 | per-batch read-sequence budget (MiB); keeps peak memory independent of read length. `0` = unbounded |
-| `--rescue` | off | second relaxed-filter pass for reads that fail the first — recovers a few % more reads in repeat-rich regions, emitted at MAPQ 0 |
 
-`--rescue` runs a second mapping pass (4× looser occurrence filter) **only** on
-reads the default pass leaves unmapped. It never disturbs a confidently-mapped
-read, and everything it recovers is reported at MAPQ 0 so downstream MAPQ
-filtering can treat it as a flagged best-guess. On simulated HiFi it lifts the
-mapping rate ~0.1 pp (≈40 reads / 50 k); use it when you want maximum recall.
+The middle s-mer offset `t = (k − s) / 2` is derived from `--k` and `--s`.
 
-You can also map directly against a FASTA (it is indexed in memory first):
-```sh
-syncmer-hifi --map reads.fq.gz genome.fa.gz -o out.paf
-```
+### Environment variables
+| Variable | Effect |
+|----------|--------|
+| `PROFILE=1` | print a per-stage CPU-time breakdown (seeding, LCP, index lookups, voting, …) after mapping |
+| `BATCH_MB=N` | fallback for `--batch-mb` when the flag is not given |
 
 ## Output
 
-Standard [PAF](https://github.com/lh3/miniasm/blob/master/PAF.md). Each mapped
-read yields one line: `qname qlen qstart qend strand target tlen tstart tend
-matches alnlen mapq`, with a trailing `cg:Z:` tag when `--cigar` is used.
-Unmapped reads get a `*` record.
-
-## Evaluating accuracy
-
-`eval.py` compares a PAF against a ground-truth TSV (`read_name  chr  start
-end`, header optional):
-
-```sh
-python3 eval.py truth.tsv out.paf            # tolerance ±1000 bp
-python3 eval.py truth.tsv out.paf 500        # custom tolerance
-```
-It reports mapping rate, accuracy (correct within tolerance), wrong-chromosome
-count, and precision.
-
-## Recommended settings
-
-| Goal | Setting |
-|------|---------|
-| Default (best HiFi accuracy + speed) | `k=19 s=10 --min-level 3` (the default) |
-| Noisy reads (> 1 % error) | build `--index-min-level 0`, map `--min-level 0` |
-| Highest precision / fewest wrong-chr | `k=11 s=7` (≈2× slower) |
+Standard [PAF](https://github.com/lh3/miniasm/blob/master/PAF.md). Each read
+yields one line: `qname qlen qstart qend strand target tlen tstart tend matches
+alnlen mapq`. There is no base-level alignment, so the placement spans the full
+read length and no `cg:Z:` CIGAR tag is emitted. Unmapped reads get a `*`
+record.
 
 ## Source layout
 
@@ -178,28 +153,24 @@ The crate is split into one module per pipeline stage:
 
 | Module | Responsibility |
 |--------|----------------|
-| `config.rs` | runtime flags (`--min-level`, `--vote`/`--chaining`, `--rescue`, …) and shared helpers |
-| `hash.rs` | rolling DNA hash, atom encoding, per-level block hashing |
-| `syncmer.rs` | open-syncmer selection, `SeedMode` |
-| `lcp.rs` | locally-consistent parsing → `Block`/`HierBlock` hierarchy |
-| `index.rs` | `GIndex` build / serialise / load (levels ≥ `--index-min-level`) |
-| `fastq.rs` | FASTQ reader, reverse-complement |
-| `align.rs` | banded affine-gap alignment and chain-guided CIGAR |
-| `chain.rs` | anchor collection, diagonal voting, chain-DP |
-| `map.rs` | per-read mapping, MAPQ, PAF output, the mapping driver |
 | `main.rs` | CLI parsing and entry point |
+| `config.rs` | runtime flags (`--min-level`, `--batch-mb`), per-stage profiling, shared helpers |
+| `hash.rs` | rolling DNA hash, k-mer encoding, per-level block hashing |
+| `syncmer.rs` | open-syncmer selection, `SeedMode` |
+| `lcp.rs` | locally-consistent parsing → `Block` / `HierForest` hierarchy, mass accounting |
+| `index.rs` | `GIndex` build / serialise / load, FASTA streaming, occurrence caps |
+| `fastq.rs` | FASTQ reader, reverse-complement |
+| `chain.rs` | anchor collection from the hierarchy, diagonal-voting locus selection |
+| `map.rs` | per-read mapping, MAPQ, PAF output, the mapping driver |
 
 ## Notes & limitations
 
-- Designed for **HiFi** (≤ ~1 % error) long reads. The k-mer-atom specificity
-  that makes it accurate relies on low error rates; it is not intended for ONT
-  or short reads. The default `--min-level 3` is tuned for this regime — above
-  ~1 % error it trades too much sensitivity, so use `--min-level 0` there.
-- The residual ~0.4 % unmapped and ~0.15 % mis-placed reads are dominated by
-  true reference duplications (segmental duplications, acrocentric paralogs) and
-  tandem-repeat arrays, where a single best locus is genuinely ambiguous; these
-  are reported at low MAPQ.
-
-## License
-
-MIT
+- Designed for **HiFi** (≤ ~1 % error) long reads. The k-mer specificity
+  that makes placement accurate relies on low error rates; it is not intended
+  for ONT or short reads.
+- The default `--min-level 3` anchors only on the coarse, unique upper levels,
+  which removes most paralog / segmental-duplication ambiguity at HiFi error
+  rates. Lower `--min-level` values trade specificity for sensitivity.
+- Placement is locus-only: the output is a position and MAPQ, not a base-level
+  alignment. Reads in genuinely ambiguous regions (segmental duplications,
+  acrocentric paralogs, tandem-repeat arrays) are reported at low MAPQ.
