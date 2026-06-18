@@ -62,30 +62,20 @@ impl<'a> Hits<'a> {
 impl GIndex {
     pub(crate) fn num_levels(&self) -> usize { self.levels.len() }
 
-    /// Look up hash h. Returns (hits, too_repetitive):
-    ///   - hits non-empty when found and occ ≤ max_occ
-    ///   - too_repetitive=true means hash exists but occ > max_occ
-    ///     (children are likely also repetitive — caller should NOT fall back)
-    /// Out-of-range levels (e.g. a top-level block above the indexed depth)
-    /// return empty hits, matching the original AoS `.get()` behaviour.
-    /// The binary search touches only the contiguous `hashes` array.
-    pub(crate) fn lookup_with_status(&self, level_0idx: usize, h: u64, max_occ: usize)
-        -> (Hits<'_>, bool)
-    {
+    /// Look up hash h. Returns empty hits when not found, when the level is
+    /// out of range (e.g. a top-level block above the indexed depth), or when
+    /// the hash is too repetitive (occ > max_occ). The binary search touches
+    /// only the contiguous `hashes` array.
+    pub(crate) fn lookup(&self, level_0idx: usize, h: u64, max_occ: usize) -> Hits<'_> {
         let empty = Hits { chrs: &[], poss: &[] };
-        let Some(lvl) = self.levels.get(level_0idx) else { return (empty, false) };
+        let Some(lvl) = self.levels.get(level_0idx) else { return empty };
         let lo = lvl.hashes.partition_point(|&x| x < h);
         let hi = lvl.hashes.partition_point(|&x| x <= h);
         if hi - lo > max_occ {
-            (empty, true)
+            empty
         } else {
-            (Hits { chrs: &lvl.chrs[lo..hi], poss: &lvl.poss[lo..hi] }, false)
+            Hits { chrs: &lvl.chrs[lo..hi], poss: &lvl.poss[lo..hi] }
         }
-    }
-
-    /// Convenience wrapper — returns empty hits on not-found OR too-repetitive.
-    pub(crate) fn lookup(&self, level_0idx: usize, h: u64, max_occ: usize) -> Hits<'_> {
-        self.lookup_with_status(level_0idx, h, max_occ).0
     }
 }
 

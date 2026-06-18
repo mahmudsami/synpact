@@ -21,7 +21,6 @@ pub(crate) struct Anchor {
 
 /// Recursively emit anchors for one block: try its own level first (highest
 /// weight), falling back to its finer children on a miss/too-repetitive.
-/// `filter` is (chr, lo, hi) in reference-start-offset coords (r_pos - q_pos).
 pub(crate) fn emit_anchors(
     forest: &HierForest,
     level: usize,
@@ -29,7 +28,6 @@ pub(crate) fn emit_anchors(
     index: &GIndex,
     max_occ: usize,
     max_occ_l1: usize,
-    filter: Option<(u8, i64, i64)>,
     anchors: &mut Vec<Anchor>,
     visited: &mut HashSet<(u8, u32, u64)>,
 ) {
@@ -52,10 +50,6 @@ pub(crate) fn emit_anchors(
         const MASS_SCALE: f32 = 16.0;
         let w = (block.mass * MASS_SCALE).round().max(1.0) as u32;
         for (chr_id, genome_pos) in hits.iter() {
-            if let Some((fc, flo, fhi)) = filter {
-                let vote_pos = genome_pos as i64 - block.pos as i64;
-                if chr_id != fc || vote_pos < flo || vote_pos > fhi { continue; }
-            }
             anchors.push(Anchor { chr: chr_id, q_pos: block.pos, r_pos: genome_pos, weight: w });
         }
         return;
@@ -64,7 +58,7 @@ pub(crate) fn emit_anchors(
     for ci in 0..block.children.len() {
         let c = forest.levels[level][idx].children[ci] as usize;
         emit_anchors(forest, level - 1, c, index,
-                     max_occ, max_occ_l1, filter, anchors, visited);
+                     max_occ, max_occ_l1, anchors, visited);
     }
 }
 
@@ -72,12 +66,7 @@ pub(crate) fn emit_anchors(
 pub(crate) fn collect_anchors(
     seq: &[u8], index: &GIndex, k: usize, s: usize, t: usize, mode: SeedMode,
     max_occ: usize, max_occ_l1: usize,
-    filter_chr: Option<u8>, filter_lo: Option<i64>, filter_hi: Option<i64>,
 ) -> Vec<Anchor> {
-    let filter = match (filter_chr, filter_lo, filter_hi) {
-        (Some(c), Some(lo), Some(hi)) => Some((c, lo, hi)),
-        _ => None,
-    };
     let forest = timed(&PROF_HIER, || extract_hier_blocks_n(seq, k, s, t, index.num_levels(), mode));
     let mut anchors = Vec::new();
     let mut visited: HashSet<(u8, u32, u64)> = HashSet::new();
@@ -86,7 +75,7 @@ pub(crate) fn collect_anchors(
         if tl >= 1 {
             for idx in 0..forest.levels[tl].len() {
                 emit_anchors(&forest, tl, idx, index, max_occ, max_occ_l1,
-                             filter, &mut anchors, &mut visited);
+                             &mut anchors, &mut visited);
             }
         }
     });
