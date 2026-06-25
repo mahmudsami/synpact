@@ -8,89 +8,6 @@ read and the reference even in the presence of sequencing errors.
 The output is standard PAF: one placement (chromosome, position, strand, MAPQ)
 per read, no base-level alignment.
 
-## How it works
-
-The pipeline turns both the reference and each read into the same kind of
-multi-level block hierarchy, then places a read by matching its blocks against
-an index of the reference's blocks.
-
-### 1. Seeds — open syncmers
-
-A k-mer (default `k = 19`) is selected as a *syncmer* iff the minimum-hash
-s-mer (default `s = 10`) inside it sits at the middle offset `t = (k − s) / 2`.
-The s-mer hashes come from a forward-only rolling DNA hash, and the minimum over
-each `(k − s + 1)`-wide window is tracked with a monotone deque, so selection is
-linear in sequence length. This open-syncmer rule keeps roughly one seed every
-`k − s + 1` bases and — crucially — is *locally consistent*: a sequencing error
-only disturbs the seeds whose window it falls in, leaving the rest identical
-between read and reference.
-
-Each selected syncmer carries a **value**: the base-4 encoding of its full
-k-mer (`k ≤ 32` keeps it in a `u64`). Using the whole k-mer this way is what
-makes placement specific at HiFi error rates.
-
-### 2. Locally-consistent parsing (LCP) into L1 blocks
-
-The stream of syncmer values is parsed into non-overlapping **L1 blocks** by
-a set of deterministic, locally-consistent rules (`locally_consistent_parsing`):
-
-- a triplet around every **local minimum**,
-- a triplet around every **local maximum** with no adjacent minimum,
-- **repetition runs** (consecutive equal values) plus their neighbours,
-- **monotone runs**, which are further split into ≤ 3-unit blocks by Cole–Vishkin
-  deterministic coin-tossing (`dct_three_coloring`) so a long ramp doesn't become
-  one giant block.
-
-Each rule depends only on a bounded window of values, so the same content always
-parses into the same blocks wherever it occurs — the read and the reference cut
-at the same places. Adjacent blocks intentionally share boundary units.
-
-### 3. Canonical block hashing and the level hierarchy
-
-Each block is reduced to a single 64-bit **block hash** over its ordered s-mer
-values (`block_hash_for_level`). The hash folds in block length and a per-level
-domain constant so blocks of different sizes or different levels occupy disjoint
-hash spaces, and applies a SplitMix64 avalanche step per value so reordering
-changes the hash. Two blocks with identical content anywhere in the genome get
-the same hash, making it a canonical block identifier.
-
-The L1 block hashes are then themselves fed back through the *same* LCP rules to
-form **L2 blocks**, and so on up to **L6** (`MAX_LEVELS = 6`). Higher levels
-cover progressively longer spans and are more unique, so they place a read
-faster and with less paralog ambiguity; lower levels are the fallback when a
-coarse block isn't found.
-
-### 4. Conservation of mass
-
-Every syncmer carries **mass 1**. A unit shared by `m` blocks contributes `1/m`
-to each, and a block's mass is the sum of its units' shares, so total mass is
-conserved across every level. This mass becomes the anchor weight at mapping
-time, giving larger / more-supported blocks proportionally more vote.
-
-### 5. Index
-
-For each stored level the reference's `(block hash, chromosome, position)` tuples
-are sorted by hash into a struct-of-arrays layout and binary-searched at query
-time. By default only levels ≥ `--min-level` (3) are stored — the coarse, unique
-levels the mapper actually anchors from — which keeps the index compact. The
-index is self-describing: it records `k`, `s`, `t`, and the seed mode, so mapping
-needs no parameter flags.
-
-### 6. Mapping a read
-
-A read is turned into its own block hierarchy, on both the forward and
-reverse-complement strands. Starting from the top level, each block is looked up
-in the index; on a miss or a too-repetitive hit it recurses into its finer
-children (`emit_anchors`). Every hit becomes a mass-weighted **anchor**
-`(query pos, reference pos)`.
-
-Placement is by **diagonal voting** (`vote_locus`): anchors are sorted by
-diagonal (`r_pos − q_pos`) and a sliding window accumulates anchor weight; the
-heaviest window is the locus. **MAPQ** is `(best − second) × 60 / best`, where
-`second` is the heaviest window at a genuinely different locus — so a read with
-one clear placement gets a high MAPQ and one with two equally-good loci gets a
-low one.
-
 ## Build
 
 Requires a Rust toolchain (`cargo`).
@@ -102,21 +19,18 @@ cargo build --release
 
 ## Usage
 
-### 1. Build an index from a reference FASTA (once)
+### 1. Build an index then map
 ```sh
 synpact --build-index genome.fa.gz genome.idx --threads 8
+synpact --map reads.fq.gz genome.idx -o out.paf --threads 8
 ```
 The reference FASTA may be plain or gzip-compressed. The index records its
 parameters, so mapping against it needs no flags. The FASTA is streamed
 chromosome-by-chromosome and processed in parallel, so peak memory stays bounded
-by the chromosomes in flight rather than the whole genome.
+by the chromosomes in flight rather than the whole genome. Fewer threads at build time
+lowers peak memory for the indexing step.
 
-### 2. Map HiFi reads → PAF
-```sh
-synpact --map reads.fq.gz genome.idx -o out.paf --threads 8
-```
-
-You can also map directly against a FASTA (it is indexed in memory first):
+### 2. Index and map in one go
 ```sh
 synpact --map reads.fq.gz genome.fa.gz -o out.paf
 ```
@@ -174,3 +88,12 @@ The crate is split into one module per pipeline stage:
 - Placement is locus-only: the output is a position and MAPQ, not a base-level
   alignment. Reads in genuinely ambiguous regions (segmental duplications,
   acrocentric paralogs, tandem-repeat arrays) are reported at low MAPQ.
+
+
+## Citation
+
+Aydin M.S. and Sahlin, K. synpact: accurate, memory-light PacBio HiFi read mapping via a hierarchy of locally-consistent syncmer blocks, forthcoming.
+
+
+## License
+Synpact is available under the XXX.
