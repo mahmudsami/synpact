@@ -8,13 +8,15 @@ read and the reference even in the presence of sequencing errors.
 The output is standard PAF: one placement (chromosome, position, strand, MAPQ)
 per read, no base-level alignment.
 
-## Build
+## Installation
 
 Requires a Rust toolchain (`cargo`).
 
 ```sh
+git clone https://github.com/mahmudsami/synpact.git
+cd synpact
 cargo build --release
-# binary: target/release/synpact
+# binary is in: target/release/synpact
 ```
 
 ## Usage
