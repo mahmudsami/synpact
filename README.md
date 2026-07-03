@@ -94,7 +94,7 @@ The crate is split into one module per pipeline stage:
 
 ## Citation
 
-Aydin M.S. and Sahlin, K. synpact: accurate, memory-light PacBio HiFi read mapping via a hierarchy of locally-consistent syncmer blocks, forthcoming.
+Aydin M.S. and Sahlin, K. synpact: accurate, memory-light PacBio HiFi read mapping via a hierarchy of locally-consistent syncmer blocks, bioRxiv 2026.06.28.735066; doi: [https://doi.org/10.64898/2026.06.28.735066](https://doi.org/10.64898/2026.06.28.735066).
 
 
 ## License
