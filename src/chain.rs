@@ -5,7 +5,6 @@ use crate::config::*;
 use crate::syncmer::*;
 use crate::lcp::*;
 use crate::index::*;
-use std::collections::HashSet;
 
 pub(crate) const CLUSTER_WINDOW: i64 = 500;
 pub(crate) const MIN_VOTES:      u32 = 1;
@@ -21,6 +20,17 @@ pub(crate) struct Anchor {
 
 /// Recursively emit anchors for one block: try its own level first (highest
 /// weight), falling back to its finer children on a miss/too-repetitive.
+///
+/// `share` is the fraction of this block's mass that this path still has to
+/// emit. LCP shares boundary sub-blocks between adjacent parents, and a parent's
+/// mass holds only its share of such a child (child mass / #parents containing
+/// it). A missed parent therefore passes each child `share / #parents`, so the
+/// weight emitted under it equals its own mass — whether its neighbour hit or
+/// missed. (Emitting the child's full mass instead counts the part a neighbour
+/// that hit already emitted a second time, so a locus that matches the read
+/// worse — more misses, more fallbacks — gains weight.) A child shared by two
+/// missed parents is reached from each with half its mass, which sums to its
+/// full mass on the same diagonal.
 pub(crate) fn emit_anchors(
     forest: &HierForest,
     level: usize,
@@ -28,37 +38,37 @@ pub(crate) fn emit_anchors(
     index: &GIndex,
     max_occ: usize,
     max_occ_l1: usize,
+    share: f32,
+    memb: &[Vec<u32>],
     anchors: &mut Vec<Anchor>,
-    visited: &mut HashSet<(u8, u32, u64)>,
 ) {
     // Level floor: ignore blocks below --min-level (don't emit, don't recurse).
     if level < min_lvl() { return; }
 
     let block = &forest.levels[level][idx];
 
-    // LCP rules share boundary sub-blocks between adjacent parents; deduplicate
-    // by block identity (level, query-pos, hash) so its mass is emitted once.
-    if !visited.insert((block.level as u8, block.pos, block.hash)) { return; }
-
     let mocc = max_occ_for_level(block.level, max_occ, max_occ_l1);
     let hits = index.lookup(block.level, block.hash, mocc);
 
     if !hits.is_empty() {
         // Conservation-of-mass weight: a block's vote = its accumulated syncmer
-        // mass (each syncmer contributes 1, split across the blocks sharing it),
-        // scaled ×MASS_SCALE so fractional masses keep integer resolution.
+        // mass (each syncmer contributes 1, split across the blocks sharing it)
+        // times the share this path emits, scaled ×MASS_SCALE so fractional
+        // masses keep integer resolution.
         const MASS_SCALE: f32 = 16.0;
-        let w = (block.mass * MASS_SCALE).round().max(1.0) as u32;
+        let w = (block.mass * share * MASS_SCALE).round().max(1.0) as u32;
         for (chr_id, genome_pos) in hits.iter() {
             anchors.push(Anchor { chr: chr_id, q_pos: block.pos, r_pos: genome_pos, weight: w });
         }
         return;
     }
-    // Block not found or too repetitive — recurse into finer children (level-1).
+    // Block not found or too repetitive — recurse into finer children (level-1),
+    // each with this block's share of it.
     for ci in 0..block.children.len() {
         let c = forest.levels[level][idx].children[ci] as usize;
+        let child_share = share / memb[level - 1][c].max(1) as f32;
         emit_anchors(forest, level - 1, c, index,
-                     max_occ, max_occ_l1, anchors, visited);
+                     max_occ, max_occ_l1, child_share, memb, anchors);
     }
 }
 
@@ -68,14 +78,21 @@ pub(crate) fn collect_anchors(
     max_occ: usize, max_occ_l1: usize,
 ) -> Vec<Anchor> {
     let forest = timed(&PROF_HIER, || extract_hier_blocks_n(seq, k, s, t, index.num_levels(), mode));
+    // memb[l][c] = number of level-(l+1) blocks that contain block c of level l.
+    let memb: Vec<Vec<u32>> = (0..forest.levels.len()).map(|l| {
+        let mut m = vec![0u32; forest.levels[l].len()];
+        if l + 1 < forest.levels.len() {
+            for p in &forest.levels[l + 1] { for &c in &p.children { m[c as usize] += 1; } }
+        }
+        m
+    }).collect();
     let mut anchors = Vec::new();
-    let mut visited: HashSet<(u8, u32, u64)> = HashSet::new();
     timed(&PROF_EMIT, || {
         let tl = forest.top_level;
         if tl >= 1 {
             for idx in 0..forest.levels[tl].len() {
                 emit_anchors(&forest, tl, idx, index, max_occ, max_occ_l1,
-                             &mut anchors, &mut visited);
+                             1.0, &memb, &mut anchors);
             }
         }
     });
