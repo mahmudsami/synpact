@@ -308,10 +308,9 @@ pub(crate) fn extract_all_levels(seq: &[u8], k: usize, s: usize, t: usize, max_l
 /// A block at any hierarchy level. `level` is 1-indexed: 1 = L1 (leaf), 2 = L2, …
 /// `pos`..`end` is the half-open query interval covered by this block (in bp).
 ///
-/// `children` holds **indices into the level below** (`forest.levels[level-1]`),
-/// not owned subtrees — LCP shares boundary sub-blocks between adjacent parents,
-/// so an owned-children tree had to deep-clone shared subtrees at every level
-/// (~32 % of map time). Index references store each block exactly once.
+/// `children` is the contiguous index range of this block's children in the
+/// level below (`forest.levels[level-1]`); LCP blocks always cover a contiguous
+/// run, and adjacent parents may share a boundary child. Empty for L1.
 pub(crate) struct HierNode {
     pub(crate) level:    usize,
     pub(crate) hash:     u64,
@@ -321,7 +320,7 @@ pub(crate) struct HierNode {
     /// is the sum of its units' masses, with a unit shared by `m` blocks
     /// contributing 1/m to each.  Total mass is conserved across all levels.
     pub(crate) mass:     f32,
-    pub(crate) children: Vec<u32>,  // indices into the level below
+    pub(crate) children: Block,  // index range into the level below
 }
 
 /// The full per-read block hierarchy, stored flat: `levels[L]` is every block at
@@ -358,7 +357,7 @@ pub(crate) fn extract_hier_blocks_n(seq: &[u8], k: usize, s: usize, t: usize, nu
         let end = syncmers[blk.last()].pos + k as u32;
         let mass: f32 = blk.range()
             .map(|i| 1.0 / sync_membership[i] as f32).sum();
-        HierNode { level: 1, hash: h, pos, end, mass, children: Vec::new() }
+        HierNode { level: 1, hash: h, pos, end, mass, children: Block { start: 0, end: 0 } }
     }).collect();
 
     if l1.is_empty() { return empty(); }
@@ -374,11 +373,7 @@ pub(crate) fn extract_hier_blocks_n(seq: &[u8], k: usize, s: usize, t: usize, nu
             let cur = &levels[level_1idx - 1];
             if cur.len() < 2 { break; }
 
-            // Snapshot the fields we need so we can push to `levels` afterwards.
             let cur_hashes: Vec<u64> = cur.iter().map(|b| b.hash).collect();
-            let cur_pos:    Vec<u32> = cur.iter().map(|b| b.pos).collect();
-            let cur_end:    Vec<u32> = cur.iter().map(|b| b.end).collect();
-            let cur_mass:   Vec<f32> = cur.iter().map(|b| b.mass).collect();
             let next_raw = locally_consistent_parsing(&cur_hashes);
             if next_raw.is_empty() { break; }
 
@@ -388,13 +383,12 @@ pub(crate) fn extract_hier_blocks_n(seq: &[u8], k: usize, s: usize, t: usize, nu
 
             let new_level: Vec<HierNode> = next_raw.iter().map(|blk| {
                 let h        = block_hash_for_level(&cur_hashes[blk.range()], level_1idx - 1);
-                let pos      = cur_pos[blk.first()];
-                let end      = cur_end[blk.last()];
+                let pos      = cur[blk.first()].pos;
+                let end      = cur[blk.last()].end;
                 // Parent mass = sum of each child's mass / (#parents sharing that child).
                 let mass: f32 = blk.range()
-                    .map(|i| cur_mass[i] / child_membership[i] as f32).sum();
-                let children: Vec<u32> = (blk.start..blk.end).collect();
-                HierNode { level: level_1idx, hash: h, pos, end, mass, children }
+                    .map(|i| cur[i].mass / child_membership[i] as f32).sum();
+                HierNode { level: level_1idx, hash: h, pos, end, mass, children: *blk }
             }).collect();
 
             levels.push(new_level);

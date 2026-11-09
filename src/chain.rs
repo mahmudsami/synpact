@@ -49,7 +49,7 @@ pub(crate) fn collect_anchors(
             let mut memb = vec![0u32; below];
             let mut child_share = vec![0.0f32; below];
             if below > 0 {
-                for p in &forest.levels[level] { for &c in &p.children { memb[c as usize] += 1; } }
+                for p in &forest.levels[level] { for c in p.children.range() { memb[c] += 1; } }
             }
             for (block, &sh) in forest.levels[level].iter().zip(&share) {
                 if sh == 0.0 { continue; }
@@ -63,8 +63,8 @@ pub(crate) fn collect_anchors(
                         anchors.push(Anchor { chr: chr_id, q_pos: block.pos, r_pos: genome_pos, weight: w });
                     }
                 } else if below > 0 {
-                    for &c in &block.children {
-                        child_share[c as usize] += sh / memb[c as usize] as f32;
+                    for c in block.children.range() {
+                        child_share[c] += sh / memb[c] as f32;
                     }
                 }
             }
