@@ -36,7 +36,10 @@ pub(crate) fn collect_anchors(
     seq: &[u8], index: &GIndex, k: usize, s: usize, t: usize, mode: SeedMode,
     max_occ: usize, max_occ_l1: usize,
 ) -> Vec<Anchor> {
-    let forest = timed(&PROF_HIER, || extract_hier_blocks_n(seq, k, s, t, index.max_level(), mode));
+    // Build the read's levels only up to --max-level (and no higher than the index
+    // holds), so anchoring starts at min(read's top level, --max-level, index top).
+    let top = index.max_level().min(max_lvl());
+    let forest = timed(&PROF_HIER, || extract_hier_blocks_n(seq, k, s, t, top, mode));
     let mut anchors = Vec::new();
     timed(&PROF_EMIT, || {
         let floor = min_lvl().max(1);

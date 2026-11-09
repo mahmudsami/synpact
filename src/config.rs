@@ -44,6 +44,17 @@ pub(crate) fn set_min_lvl(v: usize) { let _ = MIN_LVL_CELL.set(v); }
 
 pub(crate) fn min_lvl() -> usize { *MIN_LVL_CELL.get_or_init(|| 3) }
 
+/// Maximum hierarchy level: the highest level the index builds and stores, and the
+/// highest level a read is anchored from (`--max-level N`, default `MAX_LEVELS` = 6
+/// — one unified value, the ceiling to `--min-level`'s floor). Anchoring starts at
+/// the lowest of this, the read's own top level and the index's top level, then
+/// falls back down to `--min-level`. Set once from the CLI.
+pub(crate) static MAX_LVL_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+pub(crate) fn set_max_lvl(v: usize) { let _ = MAX_LVL_CELL.set(v); }
+
+pub(crate) fn max_lvl() -> usize { *MAX_LVL_CELL.get_or_init(|| crate::index::MAX_LEVELS) }
+
 /// Per-batch read-sequence budget in MiB (`--batch-mb N`, default 128). Reads are
 /// buffered until this many bytes of sequence accumulate, then mapped in parallel
 /// while the next batch is read (so two batches are resident).

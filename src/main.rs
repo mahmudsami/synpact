@@ -43,6 +43,10 @@ OPTIONS:
   --min-level N    lowest block level used to anchor a read AND the lowest level
                    stored in the index (default 3; one unified value). Default 3
                    is tuned for HiFi: high accuracy, near-zero wrong-chromosome.
+  --max-level N    highest block level stored in the index AND the level a read
+                   is first anchored from (default 6; one unified value, ≥
+                   --min-level). Mapping uses min(N, the index's top level), so
+                   an index built with a lower N caps mapping by itself.
   --max-occ N      max genomic occurrences per L2+ block before it is skipped as
                    too-repetitive (default 10000). Higher surfaces more anchors in
                    segmental-dup regions (better accuracy); very large values can
@@ -77,6 +81,17 @@ fn main() {
         set_min_lvl(v);
     }
 
+    // --max-level N (default 6): the single ceiling used for both index build and
+    // mapping. Levels above it are neither built nor used.
+    if let Some(p) = args.iter().position(|a| a == "--max-level") {
+        let v: usize = args.get(p + 1).and_then(|v| v.parse().ok())
+            .expect("--max-level requires a number");
+        set_max_lvl(v);
+    }
+    assert!(max_lvl() >= 1, "--max-level must be ≥ 1");
+    assert!(max_lvl() >= min_lvl(),
+        "--max-level ({}) must be ≥ --min-level ({})", max_lvl(), min_lvl());
+
     // --batch-mb N (default 128): per-batch read-sequence budget in MiB.
     if let Some(v) = args.iter().position(|a| a == "--batch-mb")
         .and_then(|p| args.get(p + 1)).and_then(|v| v.parse::<usize>().ok())
@@ -107,10 +122,11 @@ fn main() {
             .find(|a| !a.starts_with('-'))
             .map(|s| s.as_str()).unwrap_or("synpact.idx");
         let nthreads = rayon::current_num_threads();
-        println!("\n  Building L{MAX_LEVELS} index (levels ≥ {})  k={k}  s={s}  threads={nthreads}", min_lvl());
+        println!("\n  Building L{} index (levels {}–{})  k={k}  s={s}  threads={nthreads}",
+                 max_lvl(), min_lvl().max(1), max_lvl());
         println!("  genome : {genome_path}");
         println!("  output : {idx_path}\n");
-        let (index, elapsed) = build_index(genome_path, k, s, t, MAX_LEVELS, mode);
+        let (index, elapsed) = build_index(genome_path, k, s, t, max_lvl(), mode);
         println!("  Build time : {:.2}s", elapsed.as_secs_f64());
         print!("  Saving to {idx_path} ... ");
         std::io::stdout().flush().ok();

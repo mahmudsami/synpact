@@ -385,7 +385,7 @@ pub(crate) fn load_index(path: &str) -> (GIndex, usize, usize, usize, SeedMode) 
 
 pub(crate) const MAX_OCC_DEFAULT: usize = 10_000;
 
-/// Maximum number of hierarchy levels to build (L1 … L_MAX_LEVELS).
+/// Default `--max-level`: the number of hierarchy levels built (L1 … L_MAX_LEVELS).
 /// MEASURED block spans (k=19,s=10): each level grows ~2.27× (≈avg children
 /// per block), NOT 3×.  Actual mean spans:
 ///   L1≈40 bp → L2≈91 → L3≈207 → L4≈478 → L5≈1.1 kb → L6≈2.5 kb.
