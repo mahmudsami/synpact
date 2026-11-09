@@ -1,10 +1,3 @@
-
-/// The atom value for a window: base-4 encoding of the (forward) k-mer.
-#[inline]
-pub(crate) fn atom_value(atom: &[u8]) -> u64 {
-    encode_smer(atom)
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // 1.  Forward-only DNA rolling hash  (replaces the nthash crate)
 //
@@ -40,68 +33,6 @@ pub(crate) const DNA_SEED: [u64; 256] = {
     t[b't' as usize] = 0x94d049bb133111eb;
     t
 };
-
-/// Rolling forward-only DNA hash over a window of `w` consecutive bases.
-/// Yields one `u64` per starting position.  An N inside the current window
-/// makes that window's hash `u64::MAX` (so it is never selected as a minimum).
-pub(crate) struct DnaHashFwd<'a> {
-    pub(crate) seq:  &'a [u8],
-    pub(crate) w:    usize,
-    pub(crate) h:    u64,
-    pub(crate) n_in_window: u32,  // count of N-like bases currently inside the window
-    pub(crate) pos:  usize,
-}
-
-impl<'a> DnaHashFwd<'a> {
-    /// Returns `None` when `seq.len() < w`.
-    pub(crate) fn new(seq: &'a [u8], w: usize) -> Option<Self> {
-        if seq.len() < w { return None; }
-        let mut h = 0u64;
-        let mut n_count = 0u32;
-        for &b in &seq[..w] {
-            if DNA_SEED[b as usize] == 0 { n_count += 1; }
-            h = h.rotate_left(1) ^ DNA_SEED[b as usize];
-        }
-        Some(DnaHashFwd { seq, w, h, n_in_window: n_count, pos: 0 })
-    }
-}
-
-impl<'a> Iterator for DnaHashFwd<'a> {
-    type Item = u64;
-    #[inline]
-    fn next(&mut self) -> Option<u64> {
-        if self.pos + self.w > self.seq.len() { return None; }
-        let h = if self.n_in_window > 0 { u64::MAX } else { self.h };
-        // Roll forward one position (prepare hash for pos+1)
-        if self.pos + self.w < self.seq.len() {
-            let out = self.seq[self.pos];
-            let in_ = self.seq[self.pos + self.w];
-            if DNA_SEED[out as usize] == 0 { self.n_in_window -= 1; }
-            if DNA_SEED[in_  as usize] == 0 { self.n_in_window += 1; }
-            self.h = self.h.rotate_left(1)
-                ^ DNA_SEED[out as usize].rotate_left(self.w as u32)
-                ^ DNA_SEED[in_  as usize];
-        }
-        self.pos += 1;
-        Some(h)
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 2.  s-mer direct encoding  (A=0, C=1, G=2, T=3, base-4 positional)
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[inline]
-pub(crate) fn base4(b: u8) -> u64 {
-    match b.to_ascii_uppercase() {
-        b'A' => 0, b'C' => 1, b'G' => 2, b'T' => 3, _ => 0,
-    }
-}
-
-#[inline]
-pub(crate) fn encode_smer(smer: &[u8]) -> u64 {
-    smer.iter().fold(0u64, |acc, &b| acc * 4 + base4(b))
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 3.  Level-1 block hash
