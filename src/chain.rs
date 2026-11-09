@@ -51,6 +51,9 @@ pub(crate) fn collect_anchors(
             if below > 0 {
                 for p in &forest.levels[level] { for c in p.children.range() { memb[c] += 1; } }
             }
+            // Touch every block's bucket before looking any up, so that their
+            // cache misses overlap rather than stall the lookups one by one.
+            for block in &forest.levels[level] { index.touch(block.level, block.hash); }
             for (block, &sh) in forest.levels[level].iter().zip(&share) {
                 if sh == 0.0 { continue; }
                 let mocc = max_occ_for_level(block.level, max_occ, max_occ_l1);
