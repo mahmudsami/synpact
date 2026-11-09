@@ -2,10 +2,20 @@ use std::io::{BufRead, BufReader};
 use std::fs::File;
 use flate2::read::MultiGzDecoder;
 
+/// Complement of each byte, uppercased; non-ACGT bytes map to their uppercase self.
+const COMP: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut i = 0;
+    while i < 256 { t[i] = (i as u8).to_ascii_uppercase(); i += 1; }
+    t[b'A' as usize] = b'T'; t[b'a' as usize] = b'T';
+    t[b'C' as usize] = b'G'; t[b'c' as usize] = b'G';
+    t[b'G' as usize] = b'C'; t[b'g' as usize] = b'C';
+    t[b'T' as usize] = b'A'; t[b't' as usize] = b'A';
+    t
+};
+
 pub(crate) fn revcomp(seq: &[u8]) -> Vec<u8> {
-    seq.iter().rev().map(|&b| match b.to_ascii_uppercase() {
-        b'A' => b'T', b'T' => b'A', b'C' => b'G', b'G' => b'C', x => x,
-    }).collect()
+    seq.iter().rev().map(|&b| COMP[b as usize]).collect()
 }
 
 /// Yields raw sequence bytes for every FASTQ record in `path` (gzip or plain).

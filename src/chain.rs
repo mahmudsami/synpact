@@ -76,24 +76,18 @@ pub(crate) fn collect_anchors(
     anchors
 }
 
-/// Locus selection by diagonal voting: anchors are sorted by (chr, diagonal =
-/// r_pos − q_pos) and a sliding window of width VOTE_BAND accumulates anchor
-/// weight; the heaviest window is the locus. Returns (best (chr, ref_offset,
-/// score), second_score) — second_score is the heaviest window at a genuinely
-/// different locus (used for MAPQ). O(n log n).
-pub(crate) fn vote_locus(anchors: &mut Vec<Anchor>) -> (Option<(u8, i64, u32)>, u32) {
-    let n = anchors.len();
-    if n == 0 { return (None, 0); }
-    const VOTE_BAND: i64 = CLUSTER_WINDOW;
-    let diag = |a: &Anchor| a.r_pos as i64 - a.q_pos as i64;
-    anchors.sort_unstable_by_key(|a| (a.chr, diag(a)));
+#[inline]
+fn diag(a: &Anchor) -> i64 { a.r_pos as i64 - a.q_pos as i64 }
 
-    // Pass 1: heaviest diagonal window.
-    let mut best_sum = 0u32;
-    let (mut best_lo, mut best_hi) = (0usize, 0usize);
+const VOTE_BAND: i64 = CLUSTER_WINDOW;
+
+/// Heaviest window of `anchors` (sorted by (chr, diagonal)) spanning at most
+/// VOTE_BAND diagonals on one chromosome: (weight, first, last) of the leftmost.
+fn heaviest_window(anchors: &[Anchor]) -> (u32, usize, usize) {
+    let (mut best_sum, mut best_lo, mut best_hi) = (0u32, 0usize, 0usize);
     let mut lo = 0usize;
     let mut sum = 0u32;
-    for hi in 0..n {
+    for hi in 0..anchors.len() {
         sum = sum.saturating_add(anchors[hi].weight);
         while anchors[lo].chr != anchors[hi].chr
             || diag(&anchors[hi]) - diag(&anchors[lo]) > VOTE_BAND
@@ -103,6 +97,20 @@ pub(crate) fn vote_locus(anchors: &mut Vec<Anchor>) -> (Option<(u8, i64, u32)>, 
         }
         if sum > best_sum { best_sum = sum; best_lo = lo; best_hi = hi; }
     }
+    (best_sum, best_lo, best_hi)
+}
+
+/// Locus selection by diagonal voting: anchors are sorted by (chr, diagonal =
+/// r_pos − q_pos) and a sliding window of width VOTE_BAND accumulates anchor
+/// weight; the heaviest window is the locus. Returns (best (chr, ref_offset,
+/// score), second_score) — second_score is the heaviest window at a genuinely
+/// different locus (used for MAPQ). O(n log n).
+pub(crate) fn vote_locus(anchors: &mut Vec<Anchor>) -> (Option<(u8, i64, u32)>, u32) {
+    if anchors.is_empty() { return (None, 0); }
+    anchors.sort_unstable_by_key(|a| (a.chr, diag(a)));
+
+    // Pass 1: heaviest diagonal window.
+    let (best_sum, best_lo, best_hi) = heaviest_window(anchors);
     if best_sum < MIN_VOTES { return (None, 0); }
 
     // Representative locus: offset of the smallest-q_pos anchor in the window.
@@ -113,25 +121,14 @@ pub(crate) fn vote_locus(anchors: &mut Vec<Anchor>) -> (Option<(u8, i64, u32)>, 
         if a.q_pos < min_q { min_q = a.q_pos; off = diag(a); }
     }
 
-    // Pass 2: heaviest window at a different locus → second_score for MAPQ.
+    // Pass 2: heaviest window at a different locus → second_score for MAPQ. The
+    // anchors within VOTE_BAND of the window's diagonal are one contiguous run;
+    // no window spans it (its two sides are > 2·VOTE_BAND apart), so each side
+    // is scanned on its own.
     let win_diag = diag(&anchors[best_hi]);
-    let rest: Vec<Anchor> = anchors.iter().copied()
-        .filter(|a| a.chr != best_chr || (diag(a) - win_diag).abs() > VOTE_BAND)
-        .collect();
-    let mut second = 0u32;
-    if !rest.is_empty() {
-        let mut lo = 0usize; let mut sum = 0u32;
-        for hi in 0..rest.len() {
-            sum = sum.saturating_add(rest[hi].weight);
-            while rest[lo].chr != rest[hi].chr
-                || diag(&rest[hi]) - diag(&rest[lo]) > VOTE_BAND
-            {
-                sum = sum.saturating_sub(rest[lo].weight);
-                lo += 1;
-            }
-            if sum > second { second = sum; }
-        }
-    }
+    let a = anchors.partition_point(|x| (x.chr, diag(x)) < (best_chr, win_diag - VOTE_BAND));
+    let b = anchors.partition_point(|x| (x.chr, diag(x)) <= (best_chr, win_diag + VOTE_BAND));
+    let second = heaviest_window(&anchors[..a]).0.max(heaviest_window(&anchors[b..]).0);
 
     (Some((best_chr, off, best_sum)), second)
 }
