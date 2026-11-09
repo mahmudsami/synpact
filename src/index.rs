@@ -76,7 +76,8 @@ impl<'a> Hits<'a> {
 }
 
 impl GIndex {
-    pub(crate) fn num_levels(&self) -> usize { self.levels.len() }
+    /// Highest indexed level (levels[0] is the unused placeholder).
+    pub(crate) fn max_level(&self) -> usize { self.levels.len().saturating_sub(1) }
 
     /// Look up hash h. Returns empty hits when not found, when the level is
     /// out of range (e.g. a top-level block above the indexed depth), or when
