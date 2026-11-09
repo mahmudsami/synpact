@@ -79,6 +79,13 @@ impl GIndex {
     /// Highest indexed level (levels[0] is the unused placeholder).
     pub(crate) fn max_level(&self) -> usize { self.levels.len().saturating_sub(1) }
 
+    /// Load the first hash of h's bucket (prefetches it for a later lookup).
+    pub(crate) fn touch(&self, level_0idx: usize, h: u64) {
+        if let Some(lvl) = self.levels.get(level_0idx) {
+            std::hint::black_box(lvl.hashes.get(lvl.starts[(h >> lvl.shift) as usize] as usize).copied());
+        }
+    }
+
     /// Look up hash h. Returns empty hits when not found, when the level is
     /// out of range (e.g. a top-level block above the indexed depth), or when
     /// the hash is too repetitive (occ > max_occ). All entries with hash `h`
