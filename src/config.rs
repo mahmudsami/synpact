@@ -44,11 +44,12 @@ pub(crate) fn set_min_lvl(v: usize) { let _ = MIN_LVL_CELL.set(v); }
 
 pub(crate) fn min_lvl() -> usize { *MIN_LVL_CELL.get_or_init(|| 3) }
 
-/// Per-batch read-sequence budget in MiB (`--batch-mb N`, default 256). Reads are
-/// buffered until this many bytes of sequence accumulate, then mapped in parallel.
+/// Per-batch read-sequence budget in MiB (`--batch-mb N`, default 128). Reads are
+/// buffered until this many bytes of sequence accumulate, then mapped in parallel
+/// while the next batch is read (so two batches are resident).
 /// Batching by bytes (not by read count) keeps peak memory independent of read
 /// length. `0` = unbounded (load the whole input as one batch). Set from the CLI
-/// before mapping; falls back to env BATCH_MB then default 256.
+/// before mapping; falls back to env BATCH_MB then default 128.
 pub(crate) static BATCH_MB_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 pub(crate) fn set_batch_mb(mb: usize) { let _ = BATCH_MB_CELL.set(mb); }
@@ -56,7 +57,7 @@ pub(crate) fn set_batch_mb(mb: usize) { let _ = BATCH_MB_CELL.set(mb); }
 /// Resolved per-batch budget in *bytes* (`usize::MAX` when unbounded).
 pub(crate) fn batch_bytes_budget() -> usize {
     let mb = *BATCH_MB_CELL.get_or_init(|| {
-        std::env::var("BATCH_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(256)
+        std::env::var("BATCH_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(128)
     });
     if mb == 0 { usize::MAX } else { mb << 20 }
 }

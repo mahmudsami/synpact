@@ -45,7 +45,7 @@ synpact --map reads.fq.gz genome.fa.gz -o out.paf
 | `--threads N` | all cores | worker threads |
 | `--min-level N` | 3 | lowest block level both stored in the index and used to anchor reads (one unified floor) |
 | `--max-occ N` | 10000 | max genomic occurrences for an L2/L3 block before it is skipped as too-repetitive; higher levels scale this down, the L1 cap scales it to 2/5 |
-| `--batch-mb N` | 256 | per-batch read-sequence budget (MiB); keeps peak memory independent of read length. `0` = unbounded |
+| `--batch-mb N` | 128 | per-batch read-sequence budget (MiB; one batch is mapped while the next is read); keeps peak memory independent of read length. `0` = unbounded |
 
 The middle s-mer offset `t = (k − s) / 2` is derived from `--k` and `--s`.
 

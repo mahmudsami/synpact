@@ -38,7 +38,7 @@ OPTIONS:
   --k N            k-mer length          (default 19, must be ≤ 32)
   --s N            syncmer s-mer length  (default 10; density = 1/(k-s+1))
   --threads N      worker threads        (default: all cores)
-  --batch-mb N     per-batch read-sequence budget in MiB (default 256); keeps
+  --batch-mb N     per-batch read-sequence budget in MiB (default 128); keeps
                    peak memory independent of read length. 0 = unbounded.
   --min-level N    lowest block level used to anchor a read AND the lowest level
                    stored in the index (default 3; one unified value). Default 3
@@ -77,7 +77,7 @@ fn main() {
         set_min_lvl(v);
     }
 
-    // --batch-mb N (default 256): per-batch read-sequence budget in MiB.
+    // --batch-mb N (default 128): per-batch read-sequence budget in MiB.
     if let Some(v) = args.iter().position(|a| a == "--batch-mb")
         .and_then(|p| args.get(p + 1)).and_then(|v| v.parse::<usize>().ok())
     {
