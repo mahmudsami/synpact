@@ -18,82 +18,59 @@ pub(crate) struct Anchor {
     pub(crate) weight: u32,
 }
 
-/// Recursively emit anchors for one block: try its own level first (highest
-/// weight), falling back to its finer children on a miss/too-repetitive.
-///
-/// `share` is the fraction of this block's mass that this path still has to
-/// emit. LCP shares boundary sub-blocks between adjacent parents, and a parent's
-/// mass holds only its share of such a child (child mass / #parents containing
-/// it). A missed parent therefore passes each child `share / #parents`, so the
-/// weight emitted under it equals its own mass — whether its neighbour hit or
-/// missed. (Emitting the child's full mass instead counts the part a neighbour
-/// that hit already emitted a second time, so a locus that matches the read
-/// worse — more misses, more fallbacks — gains weight.) A child shared by two
-/// missed parents is reached from each with half its mass, which sums to its
-/// full mass on the same diagonal.
-pub(crate) fn emit_anchors(
-    forest: &HierForest,
-    level: usize,
-    idx: usize,
-    index: &GIndex,
-    max_occ: usize,
-    max_occ_l1: usize,
-    share: f32,
-    memb: &[Vec<u32>],
-    anchors: &mut Vec<Anchor>,
-) {
-    // Level floor: ignore blocks below --min-level (don't emit, don't recurse).
-    if level < min_lvl() { return; }
-
-    let block = &forest.levels[level][idx];
-
-    let mocc = max_occ_for_level(block.level, max_occ, max_occ_l1);
-    let hits = index.lookup(block.level, block.hash, mocc);
-
-    if !hits.is_empty() {
-        // Conservation-of-mass weight: a block's vote = its accumulated syncmer
-        // mass (each syncmer contributes 1, split across the blocks sharing it)
-        // times the share this path emits, scaled ×MASS_SCALE so fractional
-        // masses keep integer resolution.
-        const MASS_SCALE: f32 = 16.0;
-        let w = (block.mass * share * MASS_SCALE).round().max(1.0) as u32;
-        for (chr_id, genome_pos) in hits.iter() {
-            anchors.push(Anchor { chr: chr_id, q_pos: block.pos, r_pos: genome_pos, weight: w });
-        }
-        return;
-    }
-    // Block not found or too repetitive — recurse into finer children (level-1),
-    // each with this block's share of it.
-    for ci in 0..block.children.len() {
-        let c = forest.levels[level][idx].children[ci] as usize;
-        let child_share = share / memb[level - 1][c].max(1) as f32;
-        emit_anchors(forest, level - 1, c, index,
-                     max_occ, max_occ_l1, child_share, memb, anchors);
-    }
-}
-
 /// Collect anchors for one strand of a read from its LCP block hierarchy.
+///
+/// Levels are processed top-down. Each block first tries its own level (highest
+/// weight) and falls back to its finer children on a miss / too-repetitive.
+///
+/// `share[i]` is the fraction of block i's mass still to be emitted. LCP shares
+/// boundary sub-blocks between adjacent parents, and a parent's mass holds only
+/// its share of such a child (child mass / #parents containing it). A missed
+/// parent therefore passes each child `share / #parents`, so the weight emitted
+/// under it equals its own mass — whether its neighbour hit or missed. (Emitting
+/// the child's full mass instead counts the part a neighbour that hit already
+/// emitted a second time, so a locus that matches the read worse — more misses,
+/// more fallbacks — gains weight.) Shares from all missed parents are summed
+/// before the child is looked up, so every block is looked up at most once.
 pub(crate) fn collect_anchors(
     seq: &[u8], index: &GIndex, k: usize, s: usize, t: usize, mode: SeedMode,
     max_occ: usize, max_occ_l1: usize,
 ) -> Vec<Anchor> {
-    let forest = timed(&PROF_HIER, || extract_hier_blocks_n(seq, k, s, t, index.num_levels(), mode));
-    // memb[l][c] = number of level-(l+1) blocks that contain block c of level l.
-    let memb: Vec<Vec<u32>> = (0..forest.levels.len()).map(|l| {
-        let mut m = vec![0u32; forest.levels[l].len()];
-        if l + 1 < forest.levels.len() {
-            for p in &forest.levels[l + 1] { for &c in &p.children { m[c as usize] += 1; } }
-        }
-        m
-    }).collect();
+    let forest = timed(&PROF_HIER, || extract_hier_blocks_n(seq, k, s, t, index.max_level(), mode));
     let mut anchors = Vec::new();
     timed(&PROF_EMIT, || {
-        let tl = forest.top_level;
-        if tl >= 1 {
-            for idx in 0..forest.levels[tl].len() {
-                emit_anchors(&forest, tl, idx, index, max_occ, max_occ_l1,
-                             1.0, &memb, &mut anchors);
+        let floor = min_lvl().max(1);
+        let mut level = forest.top_level;
+        if level < floor { return; }
+        let mut share = vec![1.0f32; forest.levels[level].len()];
+        loop {
+            let below = if level > floor { forest.levels[level - 1].len() } else { 0 };
+            // memb[c] = number of blocks at this level that contain child c.
+            let mut memb = vec![0u32; below];
+            let mut child_share = vec![0.0f32; below];
+            if below > 0 {
+                for p in &forest.levels[level] { for c in p.children.range() { memb[c] += 1; } }
             }
+            for (block, &sh) in forest.levels[level].iter().zip(&share) {
+                if sh == 0.0 { continue; }
+                let mocc = max_occ_for_level(block.level, max_occ, max_occ_l1);
+                let hits = index.lookup(block.level, block.hash, mocc);
+                if !hits.is_empty() {
+                    // Vote = the block's syncmer mass times the share this path
+                    // emits, scaled ×16 so fractional masses keep integer resolution.
+                    let w = (block.mass * sh * 16.0).round().max(1.0) as u32;
+                    for (chr_id, genome_pos) in hits.iter() {
+                        anchors.push(Anchor { chr: chr_id, q_pos: block.pos, r_pos: genome_pos, weight: w });
+                    }
+                } else if below > 0 {
+                    for c in block.children.range() {
+                        child_share[c] += sh / memb[c] as f32;
+                    }
+                }
+            }
+            if below == 0 { break; }
+            share = child_share;
+            level -= 1;
         }
     });
     anchors
