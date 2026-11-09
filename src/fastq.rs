@@ -10,7 +10,7 @@ pub(crate) fn revcomp(seq: &[u8]) -> Vec<u8> {
 
 /// Yields raw sequence bytes for every FASTQ record in `path` (gzip or plain).
 pub(crate) struct FastqReader {
-    pub(crate) inner: Box<dyn BufRead>,
+    pub(crate) inner: Box<dyn BufRead + Send>,
     pub(crate) buf:   String,
 }
 
@@ -18,7 +18,7 @@ impl FastqReader {
     pub(crate) fn open(path: &str) -> Self {
         let file = File::open(path)
             .unwrap_or_else(|e| panic!("Cannot open {path}: {e}"));
-        let inner: Box<dyn BufRead> = if path.ends_with(".gz") {
+        let inner: Box<dyn BufRead + Send> = if path.ends_with(".gz") {
             Box::new(BufReader::with_capacity(1 << 20, MultiGzDecoder::new(file)))
         } else {
             Box::new(BufReader::with_capacity(1 << 20, file))

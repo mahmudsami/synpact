@@ -147,26 +147,33 @@ pub(crate) fn run_mapping(reads_path: &str, genome_or_idx: &str, paf_out: Option
     // read length; 0 = unbounded (single batch). BATCH_MAX caps tiny-read counts.
     let budget = batch_bytes_budget();
     const BATCH_MAX: usize = 200_000;      // read-count safety cap
-    let mut batch: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut batch_bytes: usize = 0;
+    let mut reads = FastqReader::open(reads_path);
+    let mut next_batch = || {
+        let mut batch: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut batch_bytes: usize = 0;
+        while batch_bytes < budget && batch.len() < BATCH_MAX {
+            let Some(read) = reads.next() else { break };
+            batch_bytes += read.1.len();
+            batch.push(read);
+        }
+        batch
+    };
 
-    // flush_batch: map all reads in parallel, then write PAF sequentially.
-    let flush_batch = |batch: &Vec<(String, Vec<u8>)>,
-                           stats: &mut MapStats,
-                           paf: &mut Option<BufWriter<File>>| {
-        let results: Vec<(String, u64, Option<MapResult>)> =
-            batch.par_iter()
-            .map(|(name, seq)| {
-                let r = map_read(seq, &index, k, s, t, mode, max_occ, max_occ_l1);
-                (name.clone(), seq.len() as u64, r)
-            })
-            .collect();
+    // Map each batch in parallel while the next one is parsed, then write PAF in order.
+    let mut batch = next_batch();
+    while !batch.is_empty() {
+        let (results, next) = rayon::join(
+            || batch.par_iter()
+                .map(|(_, seq)| map_read(seq, &index, k, s, t, mode, max_occ, max_occ_l1))
+                .collect::<Vec<_>>(),
+            &mut next_batch);
 
-        for (name, len, result) in results {
+        for ((name, seq), result) in batch.iter().zip(results) {
+            let len = seq.len() as u64;
             stats.total += 1;
             stats.bases += len;
             if result.is_some() { stats.mapped += 1; }
-            write_paf_line(paf, &name, len, &result, &index.chr_names);
+            write_paf_line(&mut paf_writer, name, len, &result, &index.chr_names);
         }
 
         if stats.total % 1_000_000 == 0 {
@@ -175,19 +182,7 @@ pub(crate) fn run_mapping(reads_path: &str, genome_or_idx: &str, paf_out: Option
                 100.0 * stats.mapped as f64 / stats.total as f64);
             std::io::stdout().flush().ok();
         }
-    };
-
-    for read in FastqReader::open(reads_path) {
-        batch_bytes += read.1.len();
-        batch.push(read);
-        if batch_bytes >= budget || batch.len() >= BATCH_MAX {
-            flush_batch(&batch, &mut stats, &mut paf_writer);
-            batch.clear();
-            batch_bytes = 0;
-        }
-    }
-    if !batch.is_empty() {
-        flush_batch(&batch, &mut stats, &mut paf_writer);
+        batch = next;
     }
     if let Some(ref mut w) = paf_writer { w.flush().unwrap(); }
 
