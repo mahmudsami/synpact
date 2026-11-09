@@ -405,7 +405,7 @@ pub(crate) fn extract_hier_blocks_n(seq: &[u8], k: usize, s: usize, t: usize, nu
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 11.  Genome index (sorted flat array, binary-searched at query time)
+// 11.  Genome index (sorted flat array + bucket table, see index.rs)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

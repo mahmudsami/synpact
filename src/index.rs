@@ -13,7 +13,7 @@ pub(crate) struct GIndex {
     /// Each level is stored struct-of-arrays (SoA): three parallel arrays sorted
     /// jointly by hash.  This is 13 bytes/entry (vs 16 for the AoS `(u64,u8,u32)`
     /// which pads to 16), an 18.75% memory saving, and — more importantly — the
-    /// binary search touches only the contiguous `hashes` array (8 B/entry
+    /// lookup touches only the contiguous `hashes` array (8 B/entry
     /// scanned instead of 16), roughly halving cache pressure during lookup.
     pub(crate) levels:    Vec<Level>,
     pub(crate) chr_names: Vec<String>,
@@ -21,15 +21,31 @@ pub(crate) struct GIndex {
 
 /// One hierarchy level, struct-of-arrays.  `hashes` is sorted ascending; the
 /// other two arrays are permuted in lockstep so index i refers to one entry.
-#[derive(Default)]
 pub(crate) struct Level {
     pub(crate) hashes: Vec<u64>,
     pub(crate) chrs:   Vec<u8>,
     pub(crate) poss:   Vec<u32>,
+    /// Bucket table over the top bits of the hash (as in strobealign): the
+    /// entries of bucket `b` are `starts[b]..starts[b + 1]`, so a lookup reads
+    /// one table entry and searches a few hashes instead of binary-searching the
+    /// whole level. Built at load time; not stored in the index file.
+    pub(crate) starts: Vec<u32>,
+    pub(crate) shift:  u32,
 }
 
 impl Level {
     #[inline] pub(crate) fn len(&self) -> usize { self.hashes.len() }
+
+    /// Wrap sorted SoA arrays and build the bucket table (≈ 4–8 entries per bucket).
+    pub(crate) fn new(hashes: Vec<u64>, chrs: Vec<u8>, poss: Vec<u32>) -> Self {
+        assert!(hashes.len() <= u32::MAX as usize, "index level has more than 2^32 entries");
+        let bits = (usize::BITS - hashes.len().leading_zeros()).saturating_sub(3).max(1);
+        let shift = 64 - bits;
+        let mut starts = vec![0u32; (1usize << bits) + 1];
+        for &h in &hashes { starts[(h >> shift) as usize + 1] += 1; }
+        for b in 1..starts.len() { starts[b] += starts[b - 1]; }
+        Level { hashes, chrs, poss, starts, shift }
+    }
 
     /// Build a SoA level from an AoS entry vector (used during index build).
     pub(crate) fn from_aos(entries: Vec<(u64, u8, u32)>) -> Self {
@@ -40,7 +56,7 @@ impl Level {
         for (h, c, p) in entries {
             hashes.push(h); chrs.push(c); poss.push(p);
         }
-        Level { hashes, chrs, poss }
+        Level::new(hashes, chrs, poss)
     }
 }
 
@@ -64,13 +80,16 @@ impl GIndex {
 
     /// Look up hash h. Returns empty hits when not found, when the level is
     /// out of range (e.g. a top-level block above the indexed depth), or when
-    /// the hash is too repetitive (occ > max_occ). The binary search touches
-    /// only the contiguous `hashes` array.
+    /// the hash is too repetitive (occ > max_occ). All entries with hash `h`
+    /// lie in bucket `h >> shift`, so only that bucket is searched.
     pub(crate) fn lookup(&self, level_0idx: usize, h: u64, max_occ: usize) -> Hits<'_> {
         let empty = Hits { chrs: &[], poss: &[] };
         let Some(lvl) = self.levels.get(level_0idx) else { return empty };
-        let lo = lvl.hashes.partition_point(|&x| x < h);
-        let hi = lvl.hashes.partition_point(|&x| x <= h);
+        let b = (h >> lvl.shift) as usize;
+        let start = lvl.starts[b] as usize;
+        let bucket = &lvl.hashes[start..lvl.starts[b + 1] as usize];
+        let lo = start + bucket.partition_point(|&x| x < h);
+        let hi = start + bucket.partition_point(|&x| x <= h);
         if hi - lo > max_occ {
             empty
         } else {
@@ -341,7 +360,7 @@ pub(crate) fn load_index(path: &str) -> (GIndex, usize, usize, usize, SeedMode) 
             }
             remaining -= n;
         }
-        Level { hashes, chrs, poss }
+        Level::new(hashes, chrs, poss)
     }
 
     assert!(version >= 6, "index version {version} too old; rebuild with --build-index");
