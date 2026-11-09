@@ -118,10 +118,11 @@ pub(crate) fn run_mapping(reads_path: &str, genome_or_idx: &str, paf_out: Option
         println!("done  ({:.2}s)", elapsed.as_secs_f64());
         (idx, ik, is, it, imode, elapsed)
     } else {
-        // In-memory index for direct FASTA mapping: build to the same level floor
-        // we will query at (min_lvl(), default 3).
-        println!("  Building index from {} (levels ≥ {}) ...", genome_or_idx, min_lvl());
-        let (idx, elapsed) = build_index(genome_or_idx, k, s, t, MAX_LEVELS, mode);
+        // In-memory index for direct FASTA mapping: build exactly the levels we
+        // will query at (--min-level … --max-level, default 3 … 6).
+        println!("  Building index from {} (levels {}–{}) ...",
+                 genome_or_idx, min_lvl().max(1), max_lvl());
+        let (idx, elapsed) = build_index(genome_or_idx, k, s, t, max_lvl(), mode);
         (idx, k, s, t, mode, elapsed)
     };
     for (li, lv) in index.levels.iter().enumerate() {
@@ -129,6 +130,16 @@ pub(crate) fn run_mapping(reads_path: &str, genome_or_idx: &str, paf_out: Option
     }
     println!("  Chromosomes        : {:>16}", index.chr_names.len());
     println!("  Index build/load   : {:>13.2}s", idx_elapsed.as_secs_f64());
+    // Levels a read is anchored on: from min(--max-level, the index's top level)
+    // down to --min-level (see collect_anchors).
+    let (lo, hi) = (min_lvl().max(1), max_lvl().min(index.max_level()));
+    if lo <= hi {
+        println!("  Anchor levels      : {:>16}", format!("L{lo}–L{hi}"));
+    } else {
+        println!("  Anchor levels      : {:>16}", "none");
+        eprintln!("  warning: the index holds levels up to L{}, below --min-level {} — no read can be anchored",
+                  index.max_level(), lo);
+    }
     println!();
 
     // ── Optional PAF output writer ────────────────────────────────────────────

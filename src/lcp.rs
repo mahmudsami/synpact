@@ -299,8 +299,9 @@ pub(crate) struct HierForest {
 }
 
 /// Build the per-read block hierarchy as a flat `HierForest`.
-/// num_levels is the highest level in the loaded index (`GIndex::max_level`); no
-/// higher level is built, since its blocks could never be found.
+/// num_levels is the highest level to anchor from: the lower of `--max-level` and
+/// the loaded index's top level (`GIndex::max_level`). No higher level is built,
+/// since its blocks would never be looked up.
 pub(crate) fn extract_hier_blocks_n(seq: &[u8], k: usize, s: usize, t: usize, num_levels: usize,
                          mode: SeedMode) -> HierForest
 {

@@ -44,6 +44,7 @@ synpact --map reads.fq.gz genome.fa.gz -o out.paf
 | `--s N` | 10 | syncmer s-mer length (density ≈ 1/(k−s+1)) |
 | `--threads N` | all cores | worker threads |
 | `--min-level N` | 3 | lowest block level both stored in the index and used to anchor reads (one unified floor) |
+| `--max-level N` | 6 | highest block level both built into the index and used to anchor reads (one unified ceiling, ≥ `--min-level`); mapping starts at min(N, the index's top level) and falls back down to `--min-level` |
 | `--max-occ N` | 10000 | max genomic occurrences for an L2/L3 block before it is skipped as too-repetitive; higher levels scale this down, the L1 cap scales it to 2/5 |
 | `--batch-mb N` | 128 | per-batch read-sequence budget (MiB; one batch is mapped while the next is read); keeps peak memory independent of read length. `0` = unbounded |
 
@@ -70,7 +71,7 @@ The crate is split into one module per pipeline stage:
 | Module | Responsibility |
 |--------|----------------|
 | `main.rs` | CLI parsing and entry point |
-| `config.rs` | runtime flags (`--min-level`, `--batch-mb`), per-stage profiling, shared helpers |
+| `config.rs` | runtime flags (`--min-level`, `--max-level`, `--batch-mb`), per-stage profiling, shared helpers |
 | `hash.rs` | rolling DNA hash, k-mer encoding, per-level block hashing |
 | `syncmer.rs` | open-syncmer selection, `SeedMode` |
 | `lcp.rs` | locally-consistent parsing → `Block` / `HierForest` hierarchy, mass accounting |
@@ -87,6 +88,10 @@ The crate is split into one module per pipeline stage:
 - The default `--min-level 3` anchors only on the coarse, unique upper levels,
   which removes most paralog / segmental-duplication ambiguity at HiFi error
   rates. Lower `--min-level` values trade specificity for sensitivity.
+- `--max-level` sets the top of the range. An index built with `--max-level N`
+  stores only levels up to N (smaller, faster to build) and caps mapping at N by
+  itself; against a full index, `--max-level` at mapping time starts anchoring
+  lower without rebuilding.
 - Placement is locus-only: the output is a position and MAPQ, not a base-level
   alignment. Reads in genuinely ambiguous regions (segmental duplications,
   acrocentric paralogs, tandem-repeat arrays) are reported at low MAPQ.
