@@ -8,6 +8,54 @@ use std::fs::File;
 use std::time::Instant;
 use std::sync::atomic::Ordering;
 use rayon::prelude::*;
+use std::collections::BTreeMap;
+use std::sync::{mpsc, Condvar, Mutex};
+
+/// Bytes of reads parsed but not yet written (sequence + name + a fixed
+/// per-record overhead, see `RECORD_OVERHEAD`): the reader blocks in `acquire`
+/// while admitting another chunk would exceed the limit, which keeps peak memory
+/// bounded however far mapping falls behind parsing, also for very short reads.
+struct InFlight {
+    limit: usize,
+    state: Mutex<(usize, bool)>,   // (bytes in flight, closed)
+    cv:    Condvar,
+}
+
+impl InFlight {
+    fn new(limit: usize) -> Self {
+        InFlight { limit, state: Mutex::new((0, false)), cv: Condvar::new() }
+    }
+    /// Wait until `n` more bytes fit (a chunk is always admitted when nothing is
+    /// in flight, so one oversized read cannot stall the pipeline), then count
+    /// them. Returns false once the pipeline is closed.
+    fn acquire(&self, n: usize) -> bool {
+        let mut st = self.state.lock().unwrap();
+        while !st.1 && st.0 > 0 && st.0 + n > self.limit {
+            st = self.cv.wait(st).unwrap();
+        }
+        st.0 += n;
+        !st.1
+    }
+    fn release(&self, n: usize) {
+        self.state.lock().unwrap().0 -= n;
+        self.cv.notify_one();
+    }
+    fn close(&self) {
+        self.state.lock().unwrap().1 = true;
+        self.cv.notify_one();
+    }
+}
+
+/// Closes the pipeline if its owner unwinds, so a panic in a mapping job or in
+/// the writer stops the reader (which would otherwise wait forever for memory
+/// to be released) and propagates instead of deadlocking.
+struct CloseOnPanic<'a>(&'a InFlight);
+
+impl Drop for CloseOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() { self.0.close(); }
+    }
+}
 
 pub(crate) struct MapResult {
     pub(crate) chr:    u8,
@@ -150,53 +198,112 @@ pub(crate) fn run_mapping(reads_path: &str, genome_or_idx: &str, paf_out: Option
             File::create(p).unwrap_or_else(|e| panic!("Cannot create {p}: {e}")))
     });
 
-    // ── Map reads (parallel — batched rayon) ─────────────────────────────────
+    // ── Map reads (parallel — streamed in small chunks) ──────────────────────
+    // Three stages run concurrently, with no barrier between batches:
+    //   reader thread  parses FASTQ into chunks of ~`chunk_bytes` of sequence and
+    //                  spawns one rayon job per chunk (the pool's FIFO injector
+    //                  starts them in input order);
+    //   rayon workers  map a chunk with par_iter, so a worker that runs out of
+    //                  chunks helps finish another chunk's reads instead of idling;
+    //   this thread    writes PAF lines in input order, holding back chunks that
+    //                  finish early.
+    // The former map-batch ‖ read-next-batch loop left every worker idle while
+    // the first batch was parsed, at the tail of each batch (waiting for its
+    // slowest read — worst when that read sat on an efficiency core or a
+    // preempted thread) and while PAF lines were written.
     println!("  Mapping reads from {} ...", reads_path);
     if paf_out.is_some() { println!("  PAF output        → {}", paf_out.unwrap()); }
     let t0 = Instant::now();
     let mut stats = MapStats::default();
 
-    // Batch by sequence-byte budget (--batch-mb) so peak memory is independent of
-    // read length; 0 = unbounded (single batch). BATCH_MAX caps tiny-read counts.
+    // --batch-mb still bounds peak memory independently of read length: the
+    // reader stalls while more than two batches' worth of reads (sequence plus
+    // names and per-record overhead; the batch loop held two batches) is parsed
+    // but not yet written. The original batch
+    // boundaries are still tracked because they decide where the stream ends: a
+    // record that fails to parse ends the current batch, and the input ends at
+    // the first batch that yields no record. BATCH_MAX caps tiny-read counts.
     let budget = batch_bytes_budget();
-    const BATCH_MAX: usize = 200_000;      // read-count safety cap
-    let mut reads = FastqReader::open(reads_path);
-    let mut next_batch = || {
-        let mut batch: Vec<(String, Vec<u8>)> = Vec::new();
-        let mut batch_bytes: usize = 0;
-        while batch_bytes < budget && batch.len() < BATCH_MAX {
-            let Some(read) = reads.next() else { break };
-            batch_bytes += read.1.len();
-            batch.push(read);
-        }
-        batch
-    };
+    const BATCH_MAX: usize = 200_000;      // read-count safety cap per batch
+    const CHUNK_BYTES: usize = 1 << 20;    // ≈ 70 HiFi reads ≈ 20 ms of one core
+    const CHUNK_MAX: usize = 4096;         // read-count cap per chunk
+    // Charged per record on top of its sequence and name bytes (Vec/String
+    // headers, the (name, seq) tuple and its MapResult), so the in-flight bound
+    // also holds for short or empty reads, which the old per-batch BATCH_MAX did.
+    const RECORD_OVERHEAD: usize = 96;
+    let chunk_bytes = (budget / 8).clamp(1, CHUNK_BYTES);
+    let inflight = InFlight::new(budget.saturating_mul(2));
 
-    // Map each batch in parallel while the next one is parsed, then write PAF in order.
-    let mut batch = next_batch();
-    while !batch.is_empty() {
-        let (results, next) = rayon::join(
-            || batch.par_iter()
-                .map(|(_, seq)| map_read(seq, &index, k, s, t, mode, max_occ, max_occ_l1))
-                .collect::<Vec<_>>(),
-            &mut next_batch);
+    type Done = (Vec<(String, Vec<u8>)>, Vec<Option<MapResult>>, usize);
+    let (tx, rx) = mpsc::channel::<(usize, Done)>();
+    let index = &index;
+    std::thread::scope(|ts| {
+        let inflight = &inflight;
+        ts.spawn(move || {
+            let tx = &tx;
+            rayon::in_place_scope(|sc| {
+                let mut reads = FastqReader::open(reads_path);
+                let (mut batch_len, mut batch_bytes) = (0usize, 0usize);
+                let mut eof = false;
+                for idx in 0.. {
+                    let mut chunk = Vec::new();
+                    let mut bytes = 0usize;   // sequence bytes (chunk sizing)
+                    let mut cost = 0usize;    // bytes charged to `inflight`
+                    while bytes < chunk_bytes && chunk.len() < CHUNK_MAX {
+                        let Some(read) = reads.next() else {
+                            if batch_len == 0 { eof = true; break; }
+                            (batch_len, batch_bytes) = (0, 0);
+                            continue;
+                        };
+                        bytes += read.1.len();
+                        cost += read.1.len() + read.0.len() + RECORD_OVERHEAD;
+                        batch_bytes += read.1.len();
+                        batch_len += 1;
+                        chunk.push(read);
+                        if batch_bytes >= budget || batch_len >= BATCH_MAX {
+                            (batch_len, batch_bytes) = (0, 0);
+                        }
+                    }
+                    if chunk.is_empty() || !inflight.acquire(cost) { break; }
+                    sc.spawn(move |_| {
+                        let _close = CloseOnPanic(inflight);
+                        let results = chunk.par_iter()
+                            .map(|(_, seq)| map_read(seq, index, k, s, t, mode, max_occ, max_occ_l1))
+                            .collect();
+                        // Fails only if the writer is gone (it panicked).
+                        let _ = tx.send((idx, (chunk, results, cost)));
+                    });
+                    if eof { break; }
+                }
+            });
+        });
 
-        for ((name, seq), result) in batch.iter().zip(results) {
-            let len = seq.len() as u64;
-            stats.total += 1;
-            stats.bases += len;
-            if result.is_some() { stats.mapped += 1; }
-            write_paf_line(&mut paf_writer, name, len, &result, &index.chr_names);
+        // Writer: emit chunks in input order.
+        let _close = CloseOnPanic(inflight);
+        let mut pending: BTreeMap<usize, Done> = BTreeMap::new();
+        let mut next_idx = 0usize;
+        for (idx, done) in rx {
+            pending.insert(idx, done);
+            while let Some((chunk, results, cost)) = pending.remove(&next_idx) {
+                let before = stats.total;
+                for ((name, seq), result) in chunk.iter().zip(results) {
+                    let len = seq.len() as u64;
+                    stats.total += 1;
+                    stats.bases += len;
+                    if result.is_some() { stats.mapped += 1; }
+                    write_paf_line(&mut paf_writer, name, len, &result, &index.chr_names);
+                }
+                inflight.release(cost);
+                next_idx += 1;
+                if stats.total / 1_000_000 > before / 1_000_000 {
+                    print!("\r  mapped {}/{} ({:.1}%)   ",
+                        stats.mapped, stats.total,
+                        100.0 * stats.mapped as f64 / stats.total as f64);
+                    std::io::stdout().flush().ok();
+                }
+            }
         }
-
-        if stats.total % 1_000_000 == 0 {
-            print!("\r  mapped {}/{} ({:.1}%)   ",
-                stats.mapped, stats.total,
-                100.0 * stats.mapped as f64 / stats.total as f64);
-            std::io::stdout().flush().ok();
-        }
-        batch = next;
-    }
+    });
     if let Some(ref mut w) = paf_writer { w.flush().unwrap(); }
 
     let map_elapsed = t0.elapsed();
