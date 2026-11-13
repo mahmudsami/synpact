@@ -24,9 +24,8 @@ pub(crate) struct MapResult {
 /// that as a competing "second-best" would collapse MAPQ to ~0 for every
 /// uniquely-mapped read, so we only promote a locus to second_score when it is
 /// genuinely different (different chromosome, or offset > CLUSTER_WINDOW).
-pub(crate) fn map_read_with_occ(fwd: &[u8], rc: &[u8], index: &GIndex,
-                     k: usize, s: usize, t: usize, mode: SeedMode,
-                     max_occ: usize, max_occ_l1: usize)
+pub(crate) fn map_read_with_occ(fwd: &[SyncmerLight], rc: &[SyncmerLight], index: &GIndex,
+                     k: usize, max_occ: usize, max_occ_l1: usize)
     -> (Option<MapResult>, u32)
 {
     let mut best: Option<MapResult> = None;
@@ -34,8 +33,7 @@ pub(crate) fn map_read_with_occ(fwd: &[u8], rc: &[u8], index: &GIndex,
     let mut vote_buf = VoteBuf::default();   // vote_locus scratch, shared by both strands
 
     for (seq, strand) in [(&fwd[..], true), (&rc[..], false)] {
-        let mut anchors = collect_anchors(seq, index, k, s, t, mode,
-                                          max_occ, max_occ_l1);
+        let mut anchors = collect_anchors(seq, index, k, max_occ, max_occ_l1);
         let (top, second_here) = timed(&PROF_SELECT, || vote_locus(&mut anchors, &mut vote_buf));
         second_score = second_score.max(second_here);
 
@@ -63,9 +61,12 @@ pub(crate) fn map_read_with_occ(fwd: &[u8], rc: &[u8], index: &GIndex,
 /// uncontested. Naturally low when two genomic loci score equally well.
 pub(crate) fn map_read(fwd: &[u8], index: &GIndex, k: usize, s: usize, t: usize, mode: SeedMode,
             max_occ: usize, max_occ_l1: usize) -> Option<MapResult> {
-    let rc = timed(&PROF_RC, || revcomp(fwd));
+    // Both strands' seeds in one pass over the read; no reverse complement is
+    // built. Timed as seeding (inside "seeding+LCP+hier"), so "revcomp" reads 0.
+    let _ = mode;   // open syncmers are the only seed mode
+    let (sf, sr) = timed(&PROF_HIER, || timed(&PROF_SEED, || select_syncmers_both(fwd, k, s, t)));
     let (mut best, second_score) =
-        map_read_with_occ(fwd, &rc, index, k, s, t, mode, max_occ, max_occ_l1);
+        map_read_with_occ(&sf, &sr, index, k, max_occ, max_occ_l1);
     if let Some(ref mut b) = best {
         if b.votes > second_score {
             b.mapq = (b.votes.saturating_sub(second_score)

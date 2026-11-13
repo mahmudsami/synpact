@@ -782,8 +782,11 @@ fn block_hash_range(vals: &[u64], r: std::ops::Range<usize>, level_0idx: usize) 
 /// num_levels is the highest level to anchor from: the lower of `--max-level` and
 /// the loaded index's top level (`GIndex::max_level`). No higher level is built,
 /// since its blocks would never be looked up.
-pub(crate) fn extract_hier_blocks_n(seq: &[u8], k: usize, s: usize, t: usize, num_levels: usize,
-                         mode: SeedMode) -> HierForest
+///
+/// `syncmers` are the read strand's seeds; the mapper selects both strands' in
+/// one pass (`select_syncmers_both`) instead of building the reverse complement.
+pub(crate) fn extract_hier_blocks_n(syncmers: &[SyncmerLight], k: usize, num_levels: usize)
+    -> HierForest
 {
     HIER_SCRATCH.with(|sc| {
         let mut sc = sc.borrow_mut();
@@ -791,7 +794,7 @@ pub(crate) fn extract_hier_blocks_n(seq: &[u8], k: usize, s: usize, t: usize, nu
         let mut levels = std::mem::take(&mut sc.outer);
         levels.clear();
         levels.push(Vec::new());   // levels[0]: unused placeholder (level numbers index directly)
-        let top_level = build_hierarchy(sc, &mut levels, seq, k, s, t, num_levels, mode);
+        let top_level = build_hierarchy(sc, &mut levels, syncmers, k, num_levels);
         HierForest { levels, top_level }
     })
 }
@@ -799,10 +802,8 @@ pub(crate) fn extract_hier_blocks_n(seq: &[u8], k: usize, s: usize, t: usize, nu
 /// `extract_hier_blocks_n` on the thread's scratch: fills `levels[1..]` and
 /// returns the top level built (0 if the read has no blocks).
 fn build_hierarchy(sc: &mut HierScratch, levels: &mut Vec<Vec<HierNode>>,
-                   seq: &[u8], k: usize, s: usize, t: usize, num_levels: usize,
-                   mode: SeedMode) -> usize
+                   syncmers: &[SyncmerLight], k: usize, num_levels: usize) -> usize
 {
-    let syncmers = timed(&PROF_SEED, || select_seeds_light(seq, k, s, t, mode));
     if syncmers.is_empty() { return 0; }
 
     let smer_vals = &mut sc.smer_vals;

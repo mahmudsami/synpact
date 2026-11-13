@@ -57,13 +57,13 @@ impl Anchor {
 /// more fallbacks — gains weight.) Shares from all missed parents are summed
 /// before the child is looked up, so every block is looked up at most once.
 pub(crate) fn collect_anchors(
-    seq: &[u8], index: &GIndex, k: usize, s: usize, t: usize, mode: SeedMode,
+    syncmers: &[SyncmerLight], index: &GIndex, k: usize,
     max_occ: usize, max_occ_l1: usize,
 ) -> Vec<Anchor> {
     // Build the read's levels only up to --max-level (and no higher than the index
     // holds), so anchoring starts at min(read's top level, --max-level, index top).
     let top = index.max_level().min(max_lvl());
-    let forest = timed(&PROF_HIER, || extract_hier_blocks_n(seq, k, s, t, top, mode));
+    let forest = timed(&PROF_HIER, || extract_hier_blocks_n(syncmers, k, top));
     let mut anchors = Vec::new();
     timed(&PROF_EMIT, || {
         let floor = min_lvl().max(1);

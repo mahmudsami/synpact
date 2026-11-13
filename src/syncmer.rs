@@ -52,7 +52,6 @@ pub(crate) fn select_syncmers_light(seq: &[u8], k: usize, s: usize, t: usize) ->
 /// exactly `(select_syncmers_light(seq, ..), select_syncmers_light(&revcomp(seq), ..))`,
 /// the second in ascending reverse-complement coordinates — without building the
 /// reverse complement, and sharing the per-base work of both strands.
-#[allow(dead_code)]   // the read mapper can use it in place of revcomp + two calls
 pub(crate) fn select_syncmers_both(seq: &[u8], k: usize, s: usize, t: usize)
     -> (Vec<SyncmerLight>, Vec<SyncmerLight>)
 {
