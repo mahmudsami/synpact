@@ -45,18 +45,28 @@ pub(crate) fn collect_anchors(
         let floor = min_lvl().max(1);
         let mut level = forest.top_level;
         if level < floor { return; }
+        // Two-stage prefetch over every block that may be looked up, before any
+        // is: first each block's bucket-table entry, then (once those have had
+        // time to arrive) the entries of the buckets whose filter admits it. The
+        // cache misses of all levels thus overlap instead of stalling the
+        // lookups one by one. Blocks under a parent that hits are prefetched in
+        // vain, but most parents miss.
+        let looked_up = || forest.levels[floor..=level].iter().flatten();
+        for block in looked_up() { index.prefetch_bucket(block.level, block.hash); }
+        for block in looked_up() { index.prefetch_entries(block.level, block.hash); }
         let mut share = vec![1.0f32; forest.levels[level].len()];
+        // memb[c] = number of blocks at this level that contain child c;
+        // child_share[c] accumulates the share passed down to child c. Both are
+        // reused across levels.
+        let mut memb: Vec<u32> = Vec::new();
+        let mut child_share: Vec<f32> = Vec::new();
         loop {
             let below = if level > floor { forest.levels[level - 1].len() } else { 0 };
-            // memb[c] = number of blocks at this level that contain child c.
-            let mut memb = vec![0u32; below];
-            let mut child_share = vec![0.0f32; below];
+            memb.clear(); memb.resize(below, 0);
+            child_share.clear(); child_share.resize(below, 0.0);
             if below > 0 {
                 for p in &forest.levels[level] { for c in p.children.range() { memb[c] += 1; } }
             }
-            // Touch every block's bucket before looking any up, so that their
-            // cache misses overlap rather than stall the lookups one by one.
-            for block in &forest.levels[level] { index.touch(block.level, block.hash); }
             for (block, &sh) in forest.levels[level].iter().zip(&share) {
                 if sh == 0.0 { continue; }
                 let mocc = max_occ_for_level(block.level, max_occ, max_occ_l1);
@@ -65,9 +75,8 @@ pub(crate) fn collect_anchors(
                     // Vote = the block's syncmer mass times the share this path
                     // emits, scaled ×16 so fractional masses keep integer resolution.
                     let w = (block.mass * sh * 16.0).round().max(1.0) as u32;
-                    for (chr_id, genome_pos) in hits.iter() {
-                        anchors.push(Anchor { chr: chr_id, q_pos: block.pos, r_pos: genome_pos, weight: w });
-                    }
+                    anchors.extend(hits.iter().map(|(chr, r_pos)|
+                        Anchor { chr, q_pos: block.pos, r_pos, weight: w }));
                 } else if below > 0 {
                     for c in block.children.range() {
                         child_share[c] += sh / memb[c] as f32;
@@ -75,7 +84,7 @@ pub(crate) fn collect_anchors(
                 }
             }
             if below == 0 { break; }
-            share = child_share;
+            std::mem::swap(&mut share, &mut child_share);
             level -= 1;
         }
     });

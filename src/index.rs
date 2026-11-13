@@ -26,11 +26,31 @@ pub(crate) struct Level {
     pub(crate) chrs:   Vec<u8>,
     pub(crate) poss:   Vec<u32>,
     /// Bucket table over the top bits of the hash (as in strobealign): the
-    /// entries of bucket `b` are `starts[b]..starts[b + 1]`, so a lookup reads
-    /// one table entry and searches a few hashes instead of binary-searching the
-    /// whole level. Built at load time; not stored in the index file.
-    pub(crate) starts: Vec<u32>,
-    pub(crate) shift:  u32,
+    /// entries of bucket `b` are `buckets[b].start..buckets[b + 1].start`, so a
+    /// lookup reads one table entry and searches a few hashes instead of
+    /// binary-searching the whole level. Built at load time; not stored in the
+    /// index file.
+    pub(crate) buckets: Vec<Bucket>,
+    pub(crate) shift:   u32,
+}
+
+/// One bucket-table entry: where the bucket starts, plus a 32-bit Bloom filter
+/// (3 bits per hash) of the hashes it holds.
+///
+/// Most lookups miss: every block of the wrong strand, and nearly every L5/L6
+/// block (a 1–2.5 kb block rarely survives 0.3% error unchanged); on CHM13 HiFi
+/// reads ~87% of lookups find nothing. Without the filter a miss costs two
+/// dependent cache misses — the table entry, then the bucket's hashes — on an
+/// index far larger than the caches. The filter sits in the table entry that
+/// must be read anyway, so all but ~8% of misses are settled by that one load
+/// and never touch `hashes`. (2 bits per hash: ~9% get through, slightly slower.
+/// A sparser table — ≈ 2–4 entries per bucket — lets fewer through and is a
+/// little faster still, but doubles the table to ~116 MB on CHM13.)
+#[derive(Clone, Copy, Default)]
+#[repr(C, align(8))]
+pub(crate) struct Bucket {
+    pub(crate) start:  u32,
+    pub(crate) filter: u32,
 }
 
 impl Level {
@@ -41,10 +61,23 @@ impl Level {
         assert!(hashes.len() <= u32::MAX as usize, "index level has more than 2^32 entries");
         let bits = (usize::BITS - hashes.len().leading_zeros()).saturating_sub(3).max(1);
         let shift = 64 - bits;
-        let mut starts = vec![0u32; (1usize << bits) + 1];
-        for &h in &hashes { starts[(h >> shift) as usize + 1] += 1; }
-        for b in 1..starts.len() { starts[b] += starts[b - 1]; }
-        Level { hashes, chrs, poss, starts, shift }
+        let mut buckets = vec![Bucket::default(); (1usize << bits) + 1];
+        for &h in &hashes {
+            let b = (h >> shift) as usize;
+            buckets[b + 1].start += 1;
+            buckets[b].filter |= filter_bits(h, shift);
+        }
+        for b in 1..buckets.len() { buckets[b].start += buckets[b - 1].start; }
+        Level { hashes, chrs, poss, buckets, shift }
+    }
+
+    /// The range of bucket `b` in the entry arrays, or None if the filter rules
+    /// out `h` (which must lie in bucket `b`).
+    #[inline]
+    fn bucket_range(&self, b: usize, h: u64) -> Option<std::ops::Range<usize>> {
+        let f = filter_bits(h, self.shift);
+        if self.buckets[b].filter & f != f { return None; }
+        Some(self.buckets[b].start as usize..self.buckets[b + 1].start as usize)
     }
 
     /// Build a SoA level from an AoS entry vector (used during index build).
@@ -58,6 +91,36 @@ impl Level {
         }
         Level::new(hashes, chrs, poss)
     }
+}
+
+/// The three Bloom-filter bits of `h` in its bucket's filter, from three 5-bit
+/// fields of the hash bits just below the bucket number (`h >> shift`), which
+/// are as uniform as the bucket number itself.
+#[inline]
+fn filter_bits(h: u64, shift: u32) -> u32 {
+    let r = h << (64 - shift);  // drop the bucket bits (1 ≤ 64 − shift < 64)
+    (1u32 << (r >> 59)) | (1u32 << ((r >> 54) & 31)) | (1u32 << ((r >> 49) & 31))
+}
+
+/// Hint the CPU to start loading the cache line holding `*p`. A prefetch never
+/// faults and has no architectural effect, so any address is fine; unlike a
+/// plain load it retires at once, so many can be in flight without stalling.
+#[inline(always)]
+fn prefetch<T>(p: *const T) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: PRFM is a hint: it does not access memory architecturally, cannot
+    // fault, and touches no register or flag other than reading `p`.
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p,
+                        options(nostack, readonly, preserves_flags));
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: as above — PREFETCHT0 is a hint that cannot fault.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = p;
 }
 
 /// A view over the matching (chr, pos) entries for a looked-up hash.
@@ -79,10 +142,28 @@ impl GIndex {
     /// Highest indexed level (levels[0] is the unused placeholder).
     pub(crate) fn max_level(&self) -> usize { self.levels.len().saturating_sub(1) }
 
-    /// Load the first hash of h's bucket (prefetches it for a later lookup).
-    pub(crate) fn touch(&self, level_0idx: usize, h: u64) {
+    /// First prefetch stage for a later `lookup(level_0idx, h)`: start loading
+    /// h's bucket-table entry. Needs no memory read, so it never stalls.
+    #[inline]
+    pub(crate) fn prefetch_bucket(&self, level_0idx: usize, h: u64) {
         if let Some(lvl) = self.levels.get(level_0idx) {
-            std::hint::black_box(lvl.hashes.get(lvl.starts[(h >> lvl.shift) as usize] as usize).copied());
+            prefetch(&lvl.buckets[(h >> lvl.shift) as usize]);
+        }
+    }
+
+    /// Second prefetch stage, once the bucket entry has (mostly) arrived: if the
+    /// bucket's filter admits h, start loading the bucket's first hash and the
+    /// matching chr/pos entries (a hit range nearly always begins in the
+    /// bucket's first line of each array).
+    #[inline]
+    pub(crate) fn prefetch_entries(&self, level_0idx: usize, h: u64) {
+        if let Some(lvl) = self.levels.get(level_0idx) {
+            if let Some(r) = lvl.bucket_range((h >> lvl.shift) as usize, h) {
+                // Pointer arithmetic only (never dereferenced here); r.start ≤ len.
+                prefetch(lvl.hashes.as_ptr().wrapping_add(r.start));
+                prefetch(lvl.chrs.as_ptr().wrapping_add(r.start));
+                prefetch(lvl.poss.as_ptr().wrapping_add(r.start));
+            }
         }
     }
 
@@ -93,9 +174,9 @@ impl GIndex {
     pub(crate) fn lookup(&self, level_0idx: usize, h: u64, max_occ: usize) -> Hits<'_> {
         let empty = Hits { chrs: &[], poss: &[] };
         let Some(lvl) = self.levels.get(level_0idx) else { return empty };
-        let b = (h >> lvl.shift) as usize;
-        let start = lvl.starts[b] as usize;
-        let bucket = &lvl.hashes[start..lvl.starts[b + 1] as usize];
+        let Some(r) = lvl.bucket_range((h >> lvl.shift) as usize, h) else { return empty };
+        let start = r.start;
+        let bucket = &lvl.hashes[r];
         let lo = start + bucket.partition_point(|&x| x < h);
         let hi = start + bucket.partition_point(|&x| x <= h);
         if hi - lo > max_occ {
