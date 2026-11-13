@@ -1,7 +1,7 @@
 use crate::config::*;
 use crate::syncmer::*;
 use crate::lcp::*;
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::fs::File;
 use std::time::Instant;
 use flate2::read::MultiGzDecoder;
@@ -81,14 +81,22 @@ impl Level {
     }
 
     /// Build a SoA level from an AoS entry vector (used during index build).
+    /// The split runs in parallel over fixed-size chunks (pure copy, so the
+    /// result does not depend on the thread count).
     pub(crate) fn from_aos(entries: Vec<(u64, u8, u32)>) -> Self {
+        const CHUNK: usize = 1 << 16;
         let n = entries.len();
-        let mut hashes = Vec::with_capacity(n);
-        let mut chrs   = Vec::with_capacity(n);
-        let mut poss   = Vec::with_capacity(n);
-        for (h, c, p) in entries {
-            hashes.push(h); chrs.push(c); poss.push(p);
-        }
+        let mut hashes = vec![0u64; n];
+        let mut chrs   = vec![0u8;  n];
+        let mut poss   = vec![0u32; n];
+        hashes.par_chunks_mut(CHUNK).zip(chrs.par_chunks_mut(CHUNK)).zip(poss.par_chunks_mut(CHUNK))
+            .zip(entries.par_chunks(CHUNK))
+            .for_each(|(((h, c), p), e)| {
+                for (i, &(eh, ec, ep)) in e.iter().enumerate() {
+                    h[i] = eh; c[i] = ec; p[i] = ep;
+                }
+            });
+        drop(entries);
         Level::new(hashes, chrs, poss)
     }
 }
@@ -187,35 +195,190 @@ impl GIndex {
     }
 }
 
+/// One line of FASTA as read by [`read_fasta_line`].
+enum FastaLine {
+    /// End of input.
+    Eof,
+    /// A sequence line, appended (trimmed, uppercased) to the caller's buffer.
+    Seq,
+    /// A '>' header line, with the record name (first word; "?" if none).
+    Header(String),
+}
+
+/// Read one FASTA line from `r`. A sequence line is appended to the end of
+/// `seq` with trailing whitespace ('\n', "\r\n", spaces, tabs — as
+/// `str::trim_end`) removed and ASCII uppercased; a header line leaves `seq`
+/// unchanged. Also returns the raw byte length consumed.
+///
+/// The line goes straight onto the end of `seq` (read_until scans for '\n'
+/// with memchr and copies in bulk) and is trimmed/uppercased in place. This
+/// avoids a String + UTF-8 validation per line and a byte-at-a-time extend: the
+/// old `lines()` loop ran at ≈1 GB/s and, as the single producer, was the
+/// critical path of the parallel index build.
+fn read_fasta_line(r: &mut impl BufRead, seq: &mut Vec<u8>) -> (usize, FastaLine) {
+    let start = seq.len();
+    let n = r.read_until(b'\n', seq).expect("read error");
+    if n == 0 { return (0, FastaLine::Eof); }
+    let mut end = seq.len();
+    while end > start && matches!(seq[end - 1], b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r' | b' ') {
+        end -= 1;
+    }
+    if end > start && seq[start] == b'>' {
+        let name = std::str::from_utf8(&seq[start + 1..end])
+            .unwrap_or("?").split_whitespace().next().unwrap_or("?")
+            .to_string();
+        seq.truncate(start);
+        (n, FastaLine::Header(name))
+    } else {
+        seq[start..end].make_ascii_uppercase();
+        seq.truncate(end);
+        (n, FastaLine::Seq)
+    }
+}
+
 /// Stream a FASTA file (plain or .gz), invoking `f(name, seq)` once per
 /// chromosome as it is parsed. Unlike loading the whole genome up front, this
 /// lets the caller process and **drop each sequence before the next is read**,
 /// so peak resident genome is bounded by what is in flight rather than the whole
-/// file. Chromosomes are delivered in file order.
+/// file. Chromosomes are delivered in file order; records with an empty
+/// sequence are skipped, and sequence before the first header is delivered
+/// under the name "".
 pub(crate) fn for_each_fasta_chr(path: &str, mut f: impl FnMut(String, Vec<u8>)) {
     let file = File::open(path).unwrap_or_else(|e| panic!("Cannot open {path}: {e}"));
-    let reader: Box<dyn BufRead> = if path.ends_with(".gz") {
+    let mut reader: Box<dyn BufRead> = if path.ends_with(".gz") {
         Box::new(BufReader::with_capacity(1 << 20, MultiGzDecoder::new(file)))
     } else {
         Box::new(BufReader::with_capacity(1 << 20, file))
     };
     let mut name = String::new();
     let mut seq: Vec<u8> = Vec::new();
-    for line in reader.lines() {
-        let line = line.expect("read error");
-        let bytes = line.trim_end().as_bytes();
-        if bytes.first() == Some(&b'>') {
-            if !seq.is_empty() {
-                f(std::mem::take(&mut name), std::mem::take(&mut seq));
+    loop {
+        match read_fasta_line(&mut reader, &mut seq).1 {
+            FastaLine::Eof => break,
+            FastaLine::Seq => {}
+            FastaLine::Header(header) => {
+                if !seq.is_empty() {
+                    f(std::mem::replace(&mut name, header), std::mem::take(&mut seq));
+                } else {
+                    name = header;
+                }
             }
-            name = std::str::from_utf8(&bytes[1..])
-                .unwrap_or("?").split_whitespace().next().unwrap_or("?")
-                .to_string();
-        } else {
-            seq.extend(bytes.iter().map(|b| b.to_ascii_uppercase()));
         }
     }
     if !seq.is_empty() { f(name, seq); }
+}
+
+/// A FASTA record of an uncompressed file, located without parsing its
+/// sequence: its name and the byte range of its sequence lines.
+struct FastaRecord {
+    name: String,
+    body: std::ops::Range<u64>,
+}
+
+impl FastaRecord {
+    /// Size of the sequence lines in bytes (newlines included): an upper bound
+    /// on, and a close estimate of, the sequence length.
+    fn body_len(&self) -> u64 { self.body.end - self.body.start }
+}
+
+/// Open `path` positioned at `range.start`, reading no further than `range.end`.
+fn open_range(path: &str, range: std::ops::Range<u64>) -> BufReader<std::io::Take<File>> {
+    let mut file = File::open(path).unwrap_or_else(|e| panic!("Cannot open {path}: {e}"));
+    file.seek(SeekFrom::Start(range.start)).expect("seek error");
+    BufReader::with_capacity(1 << 16, file.take(range.end - range.start))
+}
+
+/// Locate the records of an uncompressed FASTA file — exactly the (name, seq)
+/// pairs, in the same order, that [`for_each_fasta_chr`] delivers — so each
+/// can then be read independently with [`read_fasta_record`].
+///
+/// Why: with one streaming reader, chromosomes are processed in file order,
+/// and a large one late in the file (chrX in CHM13) starts only after the
+/// first wave of workers frees up and becomes the build's tail. Knowing every
+/// record up front lets the build process the largest first, each worker
+/// reading its own record, so nothing is read ahead and held in memory.
+///
+/// Header lines ('>' at the start of a line) are found by a parallel scan of
+/// fixed-size blocks; '>' is rare, so a block is first tested with a
+/// vectorisable OR-reduction and only searched when it contains one.
+fn scan_fasta_records(path: &str) -> Vec<FastaRecord> {
+    let len = std::fs::metadata(path)
+        .unwrap_or_else(|e| panic!("Cannot open {path}: {e}")).len();
+    const BLOCK: u64 = 1 << 22;
+    let headers: Vec<u64> = (0..len.div_ceil(BLOCK)).into_par_iter().flat_map_iter(|bi| {
+        let lo = bi * BLOCK;
+        let hi = (lo + BLOCK).min(len);
+        // Also read the byte before the block: a '>' is a header only at the
+        // start of a line (file start or right after '\n').
+        let from = lo.saturating_sub(1);
+        let mut file = File::open(path).unwrap_or_else(|e| panic!("Cannot open {path}: {e}"));
+        file.seek(SeekFrom::Start(from)).expect("seek error");
+        let mut buf = vec![0u8; (hi - from) as usize];
+        file.read_exact(&mut buf).expect("read error");
+        let mut found = Vec::new();
+        for (ci, chunk) in buf.chunks(64).enumerate() {
+            if chunk.iter().fold(0u8, |acc, &b| acc | (b == b'>') as u8) == 0 { continue; }
+            for (j, &b) in chunk.iter().enumerate() {
+                let i = ci * 64 + j;
+                let pos = from + i as u64;
+                if b == b'>' && pos >= lo && (pos == 0 || buf[i - 1] == b'\n') {
+                    found.push(pos);
+                }
+            }
+        }
+        found
+    }).collect();
+
+    // Whether the lines in `range` hold any sequence (a non-blank line).
+    let has_seq = |range: std::ops::Range<u64>| -> bool {
+        let mut r = open_range(path, range);
+        let mut scratch = Vec::new();
+        loop {
+            match read_fasta_line(&mut r, &mut scratch).1 {
+                FastaLine::Eof => return false,
+                _ if !scratch.is_empty() => return true,
+                _ => {}
+            }
+        }
+    };
+
+    // Sequence before the first header forms a record named "" (as when streaming).
+    let first = headers.first().copied().unwrap_or(len);
+    let lead = (first > 0 && has_seq(0..first))
+        .then(|| FastaRecord { name: String::new(), body: 0..first });
+    let named: Vec<Option<FastaRecord>> = (0..headers.len()).into_par_iter().map(|i| {
+        let end = headers.get(i + 1).copied().unwrap_or(len);
+        let mut r = open_range(path, headers[i]..end);
+        let (n, line) = read_fasta_line(&mut r, &mut Vec::new());
+        let FastaLine::Header(name) = line else { unreachable!("record does not start with a header") };
+        let body = headers[i] + n as u64..end;
+        has_seq(body.clone()).then(|| FastaRecord { name, body })
+    }).collect();
+    lead.into_iter().chain(named.into_iter().flatten()).collect()
+}
+
+/// Read one record located by [`scan_fasta_records`]: its sequence lines,
+/// trimmed and uppercased exactly as [`for_each_fasta_chr`] does.
+fn read_fasta_record(path: &str, rec: &FastaRecord) -> Vec<u8> {
+    let mut r = open_range(path, rec.body.clone());
+    let mut seq = Vec::with_capacity(rec.body_len() as usize);
+    while !matches!(read_fasta_line(&mut r, &mut seq).1, FastaLine::Eof) {}
+    seq
+}
+
+/// Position of the first byte at or after `from` that is 'N' (`want_n`) or is
+/// not 'N' (`!want_n`); `seq.len()` if there is none. Whole 32-byte chunks
+/// without a match are skipped with a vectorisable reduction, so splitting a
+/// chromosome on N runs costs a fraction of a cycle per base instead of a
+/// byte-at-a-time state machine.
+fn next_n_or_not(seq: &[u8], from: usize, want_n: bool) -> usize {
+    let is_match = |b: u8| (b == b'N') == want_n;
+    let mut i = from;
+    while let Some(chunk) = seq.get(i..i + 32) {
+        if chunk.iter().fold(false, |acc, &b| acc | is_match(b)) { break; }
+        i += 32;
+    }
+    seq[i..].iter().position(|&b| is_match(b)).map_or(seq.len(), |p| i + p)
 }
 
 /// Extract entries for all N levels from one chromosome (N-split on 'N' runs).
@@ -227,8 +390,6 @@ pub(crate) fn chr_to_entries_n(chr_id: u8, seq: &[u8], k: usize, s: usize, t: us
     // (kept as empty slots so a block's level still indexes its array).
     let min_level = min_lvl();
     let mut per_level: Vec<Vec<(u64, u8, u32)>> = vec![Vec::new(); max_levels];
-    let mut seg_start: Option<usize> = None;
-
     let flush = |s0: usize, end: usize, per_level: &mut Vec<Vec<(u64, u8, u32)>>| {
         if end - s0 < k { return; }
         let levels = extract_all_levels(&seq[s0..end], k, s, t, max_levels, mode);
@@ -241,23 +402,29 @@ pub(crate) fn chr_to_entries_n(chr_id: u8, seq: &[u8], k: usize, s: usize, t: us
         }
     };
 
-    for (i, &b) in seq.iter().enumerate() {
-        match (seg_start, matches!(b, b'N')) {
-            (None, false) => seg_start = Some(i),
-            (Some(s0), true) => { flush(s0, i, &mut per_level); seg_start = None; }
-            _ => {}
-        }
+    // Segments are the maximal runs of non-'N' bytes.
+    let mut s0 = next_n_or_not(seq, 0, false);
+    while s0 < seq.len() {
+        let end = next_n_or_not(seq, s0, true);
+        flush(s0, end, &mut per_level);
+        s0 = next_n_or_not(seq, end, false);
     }
-    if let Some(s0) = seg_start { flush(s0, seq.len(), &mut per_level); }
 
     per_level
 }
+
+/// Index build: cap on the sequence bases (per worker thread) whose entries are
+/// being extracted at once from a plain FASTA. Extraction peaks at ≈5 bytes of
+/// working memory per base, so 150 Mbp/thread ≈ 0.75 GB/thread — about what the
+/// streaming build reached with its staggered starts (≈7 GB on CHM13 with 10
+/// threads) while still keeping every thread busy.
+const BUILD_BASES_PER_THREAD: u64 = 150_000_000;
 
 pub(crate) fn build_index(genome_path: &str, k: usize, s: usize, t: usize, max_levels: usize,
                mode: SeedMode) -> (GIndex, std::time::Duration)
 {
     use std::sync::mpsc::sync_channel;
-    use std::sync::Mutex;
+    use std::sync::{Condvar, Mutex};
 
     let t0 = Instant::now();
     let min_level = min_lvl();
@@ -271,40 +438,103 @@ pub(crate) fn build_index(genome_path: &str, k: usize, s: usize, t: usize, max_l
     let merged: Vec<Mutex<Vec<(u64, u8, u32)>>> =
         (0..max_levels).map(|_| Mutex::new(Vec::new())).collect();
 
-    // A single reader thread parses the FASTA and feeds (chr_id, seq) into a
-    // bounded channel; a rayon worker pool drains it, extracts entries, then
-    // drops each sequence. The bound (2) caps *queued* sequences on top of the
-    // ones being processed (≈ one per worker), so peak resident genome is a
-    // handful of chromosomes rather than the whole file. Extraction dwarfs
-    // gzip decode, so the reader stays comfortably ahead at this small depth.
-    let (tx, rx) = sync_channel::<(u8, Vec<u8>)>(2);
+    // Extract one chromosome's entries and append them to `merged`.
+    let process = |chr_id: u8, seq: Vec<u8>| {
+        let per_level = chr_to_entries_n(chr_id, &seq, k, s, t, max_levels, mode);
+        drop(seq);
+        for (li, entries) in per_level.into_iter().enumerate() {
+            if li < merged.len() && !entries.is_empty() {
+                merged[li].lock().unwrap().extend(entries);
+            }
+        }
+    };
 
-    let chr_names: Vec<String> = std::thread::scope(|scope| {
-        // Producer: assign chr_id in file order so it matches chr_names.
-        let producer = scope.spawn(move || {
-            let mut names: Vec<String> = Vec::new();
-            let mut chr_id: usize = 0;
-            for_each_fasta_chr(genome_path, |name, seq| {
-                names.push(name);
-                tx.send((chr_id as u8, seq)).expect("index build worker hung up");
-                chr_id += 1;
+    // The parallel record scan below seeks within the file, so anything that is
+    // not a regular file (a pipe, `<(zcat genome.fa.gz)`, /dev/stdin) is streamed
+    // like gzip. A path that cannot be opened also takes this branch and reports
+    // the error when the reader opens it.
+    let seekable = std::fs::metadata(genome_path).map(|m| m.is_file()).unwrap_or(false);
+    let chr_names: Vec<String> = if genome_path.ends_with(".gz") || !seekable {
+        // A gzip stream (or pipe) can only be read front to back: a single reader thread
+        // parses the FASTA and feeds (chr_id, seq) into a bounded channel; a
+        // rayon worker pool drains it, extracts entries, then drops each
+        // sequence. The bound (2) caps *queued* sequences on top of the ones
+        // being processed (≈ one per worker), so peak resident genome is a
+        // handful of chromosomes rather than the whole file. Extraction dwarfs
+        // gzip decode, so the reader stays comfortably ahead at this small depth.
+        let (tx, rx) = sync_channel::<(u8, Vec<u8>)>(2);
+        std::thread::scope(|scope| {
+            // Producer: assign chr_id in file order so it matches chr_names.
+            let producer = scope.spawn(move || {
+                let mut names: Vec<String> = Vec::new();
+                let mut chr_id: usize = 0;
+                for_each_fasta_chr(genome_path, |name, seq| {
+                    names.push(name);
+                    tx.send((chr_id as u8, seq)).expect("index build worker hung up");
+                    chr_id += 1;
+                });
+                names // tx dropped here → channel closes → consumers finish
             });
-            names // tx dropped here → channel closes → consumers finish
-        });
 
-        // Consumers: one chromosome per task, sequence freed at task end.
-        rx.into_iter().par_bridge().for_each(|(chr_id, seq)| {
-            let per_level = chr_to_entries_n(chr_id, &seq, k, s, t, max_levels, mode);
-            drop(seq);
-            for (li, entries) in per_level.into_iter().enumerate() {
-                if li < merged.len() && !entries.is_empty() {
-                    merged[li].lock().unwrap().extend(entries);
-                }
+            // Consumers: one chromosome per task, sequence freed at task end.
+            rx.into_iter().par_bridge().for_each(|(chr_id, seq)| process(chr_id, seq));
+
+            producer.join().unwrap()
+        })
+    } else {
+        // Plain FASTA: locate every record first, then process them largest
+        // first (LPT scheduling), each worker reading its own record when it
+        // starts it, so a large chromosome late in the file no longer becomes
+        // the tail. chr_id stays the record's rank in file order.
+        //
+        // Starting the largest records all at once would also line up their
+        // extraction working sets (≈5 bytes/base at peak), which the streaming
+        // reader used to stagger (+~1 GB peak RSS on CHM13, 10 threads). So the bases
+        // in flight are capped at BUILD_BASES_PER_THREAD × threads: a worker
+        // takes the largest pending record that fits under the cap (or any
+        // record when nothing is in flight), and otherwise waits for one to
+        // finish. Smaller records fill the gaps, so the cores stay busy.
+        let records = scan_fasta_records(genome_path);
+        let nthreads = rayon::current_num_threads();
+        let budget = BUILD_BASES_PER_THREAD * nthreads as u64;
+        // Ascending by size, so the largest pending record is popped off the end.
+        let mut pending: Vec<usize> = (0..records.len()).collect();
+        pending.sort_by_key(|&i| records[i].body_len());
+        let sched = Mutex::new((pending, 0u64)); // (pending records, bases in flight)
+        let freed = Condvar::new();
+        // Returns a record's bases to the budget when its task ends, even by panic
+        // (so the other workers are not left waiting forever).
+        struct Release<'a> { sched: &'a Mutex<(Vec<usize>, u64)>, freed: &'a Condvar, len: u64 }
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                if let Ok(mut g) = self.sched.lock() { g.1 -= self.len; }
+                self.freed.notify_all();
+            }
+        }
+        std::thread::scope(|scope| {
+            for _ in 0..nthreads {
+                scope.spawn(|| loop {
+                    let (i, _release) = {
+                        let mut g = sched.lock().unwrap();
+                        loop {
+                            let (pending, in_flight) = &mut *g;
+                            if pending.is_empty() { return; }
+                            let fits = |&i: &usize| *in_flight == 0 || *in_flight + records[i].body_len() <= budget;
+                            if let Some(j) = pending.iter().rposition(fits) {
+                                let i = pending.remove(j);
+                                let len = records[i].body_len();
+                                *in_flight += len;
+                                break (i, Release { sched: &sched, freed: &freed, len });
+                            }
+                            g = freed.wait(g).unwrap();
+                        }
+                    };
+                    process(i as u8, read_fasta_record(genome_path, &records[i]));
+                });
             }
         });
-
-        producer.join().unwrap()
-    });
+        records.into_iter().map(|r| r.name).collect()
+    };
     println!("{} chromosomes", chr_names.len());
 
     let mut merged: Vec<Vec<(u64, u8, u32)>> =
@@ -317,9 +547,10 @@ pub(crate) fn build_index(genome_path: &str, k: usize, s: usize, t: usize, max_l
     // Full-tuple key: entries arrive in nondeterministic worker order, so sort
     // on (hash, chr, pos) — not hash alone — to keep the built index
     // reproducible regardless of thread scheduling.
-    for level in &mut merged {
-        level.sort_unstable();
-    }
+    // Sorted in parallel (all levels at once, each with a parallel sort): the
+    // key is a total order and equal tuples are indistinguishable, so the
+    // result is identical to a sequential sort_unstable.
+    merged.par_iter_mut().for_each(|level| level.par_sort_unstable());
     println!("done");
 
     // levels[0] is an unused placeholder (the old L0 raw-syncmer slot) so block
@@ -332,7 +563,7 @@ pub(crate) fn build_index(genome_path: &str, k: usize, s: usize, t: usize, max_l
     println!("    {}", level_counts.join("  "));
 
     // Convert AoS build buffers → SoA levels.
-    let levels: Vec<Level> = merged.into_iter().map(Level::from_aos).collect();
+    let levels: Vec<Level> = merged.into_par_iter().map(Level::from_aos).collect();
 
     let elapsed = t0.elapsed();
     (GIndex { levels, chr_names }, elapsed)
@@ -352,10 +583,19 @@ pub(crate) fn build_index(genome_path: &str, k: usize, s: usize, t: usize, max_l
 /// Write one level in the packed 13-bytes/entry on-disk format.
 pub(crate) fn write_entries(w: &mut impl Write, lvl: &Level) {
     w.write_all(&(lvl.len() as u64).to_le_bytes()).unwrap();
-    for i in 0..lvl.len() {
-        w.write_all(&lvl.hashes[i].to_le_bytes()).unwrap();
-        w.write_all(&[lvl.chrs[i]]).unwrap();
-        w.write_all(&lvl.poss[i].to_le_bytes()).unwrap();
+    // Encode a chunk of records into one buffer and write it with a single call;
+    // three tiny write_all calls per entry spent most of the save time in
+    // BufWriter bookkeeping rather than in I/O.
+    const CHUNK: usize = 1 << 16;
+    let mut buf = vec![0u8; CHUNK * 13];
+    for ((h, c), p) in lvl.hashes.chunks(CHUNK).zip(lvl.chrs.chunks(CHUNK)).zip(lvl.poss.chunks(CHUNK)) {
+        let out = &mut buf[..h.len() * 13];
+        for (i, rec) in out.chunks_exact_mut(13).enumerate() {
+            rec[..8].copy_from_slice(&h[i].to_le_bytes());
+            rec[8] = c[i];
+            rec[9..].copy_from_slice(&p[i].to_le_bytes());
+        }
+        w.write_all(out).unwrap();
     }
 }
 
@@ -393,7 +633,9 @@ pub(crate) fn read_u32le(r: &mut impl Read) -> u32 {
 pub(crate) fn load_index(path: &str) -> (GIndex, usize, usize, usize, SeedMode) {
     let file = File::open(path)
         .unwrap_or_else(|e| panic!("Cannot open {path}: {e}"));
-    let mut r = BufReader::with_capacity(1 << 23, file);
+    // Only the header is read through this reader; the levels are read by
+    // `read_level` with their own handles.
+    let mut r = BufReader::with_capacity(1 << 16, file);
 
     let mut magic = [0u8; 8];
     r.read_exact(&mut magic).unwrap();
@@ -428,34 +670,49 @@ pub(crate) fn load_index(path: &str) -> (GIndex, usize, usize, usize, SeedMode) 
     }
 
     // Read one level directly into SoA arrays from the packed 13-byte format.
-    fn read_level(r: &mut impl Read) -> Level {
+    // The entries are decoded in parallel: each fixed-size chunk opens its own
+    // handle at its own offset and fills its slice of the pre-sized arrays, so
+    // the read and the AoS→SoA decode both spread over the threads (on a
+    // single thread this is the old chunked loop minus the per-entry pushes).
+    // Returns the level and the file offset just past it.
+    fn read_level(path: &str, offset: u64) -> (Level, u64) {
+        let open_at = |at: u64| {
+            let mut f = File::open(path).unwrap_or_else(|e| panic!("Cannot open {path}: {e}"));
+            f.seek(SeekFrom::Start(at)).unwrap();
+            f
+        };
         let mut b8 = [0u8; 8];
-        r.read_exact(&mut b8).unwrap();
+        open_at(offset).read_exact(&mut b8).unwrap();
         let num = u64::from_le_bytes(b8) as usize;
-        let mut hashes = Vec::with_capacity(num);
-        let mut chrs   = Vec::with_capacity(num);
-        let mut poss   = Vec::with_capacity(num);
-        const CHUNK: usize = 65536;
-        let mut buf = vec![0u8; CHUNK * 13];
-        let mut remaining = num;
-        while remaining > 0 {
-            let n = remaining.min(CHUNK);
-            r.read_exact(&mut buf[..n * 13]).unwrap();
-            for i in 0..n {
-                let base = i * 13;
-                hashes.push(u64::from_le_bytes(buf[base..base+8].try_into().unwrap()));
-                chrs.push(buf[base+8]);
-                poss.push(u32::from_le_bytes(buf[base+9..base+13].try_into().unwrap()));
-            }
-            remaining -= n;
-        }
-        Level::new(hashes, chrs, poss)
+        let data = offset + 8;
+        let mut hashes = vec![0u64; num];
+        let mut chrs   = vec![0u8;  num];
+        let mut poss   = vec![0u32; num];
+        const CHUNK: usize = 1 << 18;
+        hashes.par_chunks_mut(CHUNK).zip(chrs.par_chunks_mut(CHUNK)).zip(poss.par_chunks_mut(CHUNK))
+            .enumerate()
+            .for_each(|(ci, ((h, c), p))| {
+                let mut buf = vec![0u8; h.len() * 13];
+                open_at(data + (ci * CHUNK * 13) as u64).read_exact(&mut buf).unwrap();
+                for (i, rec) in buf.chunks_exact(13).enumerate() {
+                    h[i] = u64::from_le_bytes(rec[..8].try_into().unwrap());
+                    c[i] = rec[8];
+                    p[i] = u32::from_le_bytes(rec[9..].try_into().unwrap());
+                }
+            });
+        (Level::new(hashes, chrs, poss), data + num as u64 * 13)
     }
 
     assert!(version >= 6, "index version {version} too old; rebuild with --build-index");
     // Explicit num_levels + entries in level order (level 0 = unused placeholder).
     let num_levels = read_u32le(&mut r) as usize;
-    let levels: Vec<Level> = (0..num_levels).map(|_| read_level(&mut r)).collect();
+    let mut offset = r.stream_position().unwrap();
+    drop(r);
+    let levels: Vec<Level> = (0..num_levels).map(|_| {
+        let (lvl, next) = read_level(path, offset);
+        offset = next;
+        lvl
+    }).collect();
 
     (GIndex { levels, chr_names }, k, s, t, mode)
 }
