@@ -31,11 +31,12 @@ pub(crate) fn map_read_with_occ(fwd: &[u8], rc: &[u8], index: &GIndex,
 {
     let mut best: Option<MapResult> = None;
     let mut second_score: u32 = 0;
+    let mut vote_buf = VoteBuf::default();   // vote_locus scratch, shared by both strands
 
     for (seq, strand) in [(&fwd[..], true), (&rc[..], false)] {
         let mut anchors = collect_anchors(seq, index, k, s, t, mode,
                                           max_occ, max_occ_l1);
-        let (top, second_here) = timed(&PROF_SELECT, || vote_locus(&mut anchors));
+        let (top, second_here) = timed(&PROF_SELECT, || vote_locus(&mut anchors, &mut vote_buf));
         second_score = second_score.max(second_here);
 
         if let Some((chr, pos, score)) = top {
