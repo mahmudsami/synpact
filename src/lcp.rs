@@ -43,10 +43,20 @@ impl Block {
 /// Each output colour depends only on a bounded window of `vals` (≈ log* rounds,
 /// successor-directed), so the colouring — and the split derived from it — is
 /// locally consistent: a single changed value perturbs only nearby boundaries.
+#[cfg(test)]
 fn dct_three_coloring(vals: &[u64]) -> Vec<u64> {
+    let mut col = Vec::new();
+    dct_three_coloring_into(vals, &mut col);
+    col
+}
+
+/// `dct_three_coloring` writing into a caller-owned buffer, so parsing many
+/// runs reuses one allocation.
+fn dct_three_coloring_into(vals: &[u64], col: &mut Vec<u64>) {
     let m = vals.len();
     debug_assert!(m >= 2);
-    let mut col: Vec<u64> = vals.to_vec();
+    col.clear();
+    col.extend_from_slice(vals);
 
     // ── Phase 1: reduce to ≤ 6 colours ───────────────────────────────────────
     // In place: entry i is rewritten from itself and its not-yet-rewritten successor.
@@ -68,7 +78,6 @@ fn dct_three_coloring(vals: &[u64]) -> Vec<u64> {
             col[i] = (0..=2).find(|&c| c != l && c != r).unwrap();
         }
     }
-    col
 }
 
 /// Split a strictly-monotone (hence repetition-free) run of values `vals` into
@@ -89,25 +98,32 @@ fn dct_three_coloring(vals: &[u64]) -> Vec<u64> {
 /// proper sequence.  Every emitted block therefore spans ≤ 3 indices; no chunking.
 /// Each block is passed to `emit` as a half-open index range `start..end` into
 /// `vals`.
-pub(crate) fn split_monotone_run(vals: &[u64], mut emit: impl FnMut(usize, usize)) {
+#[cfg(test)]
+pub(crate) fn split_monotone_run(vals: &[u64], emit: impl FnMut(usize, usize)) {
+    split_monotone_run_buf(vals, &mut Vec::new(), emit)
+}
+
+/// `split_monotone_run` with a caller-owned colouring buffer.
+fn split_monotone_run_buf(vals: &[u64], col: &mut Vec<u64>, mut emit: impl FnMut(usize, usize)) {
     let m = vals.len();
     if m <= 3 { return emit(0, m); }
 
     // Colour the run by its *content* (the values) so read and reference split
     // identically wherever the same run occurs.
-    let col = dct_three_coloring(vals);
+    dct_three_coloring_into(vals, col);
+    let col = &col[..];
 
     let mut triplet = |i: usize| emit(i.saturating_sub(1), (i + 1).min(m - 1) + 1);
     // Rule 1 — local-minimum triplet.
     for i in 0..m {
-        if is_local_min(&col, i) { triplet(i); }
+        if is_local_min(col, i) { triplet(i); }
     }
     // Rule 2 — local-maximum triplet, when no adjacent local minimum (that min's
     // own triplet already covers the maximum).
     for i in 0..m {
-        if is_local_max(&col, i) {
-            let l_min = i > 0     && is_local_min(&col, i - 1);
-            let r_min = i + 1 < m && is_local_min(&col, i + 1);
+        if is_local_max(col, i) {
+            let l_min = i > 0     && is_local_min(col, i - 1);
+            let r_min = i + 1 < m && is_local_min(col, i + 1);
             if !l_min && !r_min { triplet(i); }
         }
     }
@@ -131,18 +147,24 @@ pub(crate) fn locally_consistent_parsing(values: &[u64]) -> Vec<Block> {
     if n == 1 { return vec![Block { start: 0, end: 1 }]; }
 
     let mut assigned = vec![false; n];
-    let mut blocks: Vec<Block> = Vec::new();
+    // Blocks of rules 1–2, rule 3 and rule 4 are collected separately: the first
+    // two lists come out in start order, so the final start-ordered list is a
+    // merge rather than a sort of everything (see the end of this function).
+    let mut minmax: Vec<Block> = Vec::with_capacity(n / 2 + 1);
+    let mut reps:   Vec<Block> = Vec::new();
+    let mut mono_blocks: Vec<Block> = Vec::new();
 
     // Commit the contiguous inclusive range `lo..=hi` (clamped to the sequence) as
-    // one block, but only if it contributes at least one not-yet-assigned position
-    // (shared boundaries between adjacent blocks are intentional intersections).
+    // one block of `$list`, but only if it contributes at least one not-yet-assigned
+    // position (shared boundaries between adjacent blocks are intentional
+    // intersections).
     macro_rules! commit_range {
-        ($lo:expr, $hi:expr) => {{
+        ($list:ident, $lo:expr, $hi:expr) => {{
             let lo = $lo;
             let hi = ($hi).min(n - 1);
             if assigned[lo..=hi].contains(&false) {
                 assigned[lo..=hi].fill(true);
-                blocks.push(Block { start: lo as u32, end: hi as u32 + 1 });
+                $list.push(Block { start: lo as u32, end: hi as u32 + 1 });
             }
         }};
     }
@@ -157,7 +179,7 @@ pub(crate) fn locally_consistent_parsing(values: &[u64]) -> Vec<Block> {
         let lone_max = is_local_max(values, i)
             && !(i > 0 && is_min(i - 1)) && !(i + 1 < n && is_min(i + 1));
         if is_min(i) || lone_max {
-            commit_range!(i.saturating_sub(1), i + 1);
+            commit_range!(minmax, i.saturating_sub(1), i + 1);
         }
     }
 
@@ -169,7 +191,7 @@ pub(crate) fn locally_consistent_parsing(values: &[u64]) -> Vec<Block> {
             while j < n && values[j] == values[i] { j += 1; }
             if j - i >= 2 {
                 // j is one past the run; the macro clamps it to the next syncmer.
-                commit_range!(i.saturating_sub(1), j);
+                commit_range!(reps, i.saturating_sub(1), j);
             }
             i = j;
         }
@@ -181,6 +203,7 @@ pub(crate) fn locally_consistent_parsing(values: &[u64]) -> Vec<Block> {
     // neighbours or sequence ends) are assigned. Split such runs into ≤3-unit blocks
     // via DCT so they aren't one big featureless block (deterministic & locally
     // consistent → genome and read split identically).
+    let mut col_buf: Vec<u64> = Vec::new();
     let mut i = 0;
     while let Some(u) = assigned[i..].iter().position(|&x| !x).map(|o| o + i) {
         let up = values[u] < values[u + 1];
@@ -189,13 +212,38 @@ pub(crate) fn locally_consistent_parsing(values: &[u64]) -> Vec<Block> {
         while s > 0 && mono(s - 1) { s -= 1; }
         let mut b = u;
         while b + 1 < n && mono(b) { b += 1; }
-        split_monotone_run(&values[s..=b], |lo, hi| commit_range!(s + lo, s + hi - 1));
+        split_monotone_run_buf(&values[s..=b], &mut col_buf,
+                               |lo, hi| commit_range!(mono_blocks, s + lo, s + hi - 1));
         i = b;
     }
     debug_assert!(!assigned.contains(&false), "LCP bug: unassigned position\nvalues={values:?}");
 
-    blocks.sort_by_key(|b| b.start);
-    blocks
+    // Equivalent to a stable sort by `start` of minmax ++ reps ++ mono_blocks:
+    // `minmax` and `reps` are already in start order (each rule scans i upwards);
+    // `mono_blocks` is not (a run emits its min triplets before its max
+    // triplets), so it is stably sorted on its own. A stable 3-way merge preferring
+    // the earlier list on equal starts then reproduces that sort exactly.
+    debug_assert!(minmax.windows(2).all(|w| w[0].start <= w[1].start));
+    debug_assert!(reps.windows(2).all(|w| w[0].start <= w[1].start));
+    mono_blocks.sort_by_key(|b| b.start);
+    merge3_by_start(&minmax, &reps, &mono_blocks)
+}
+
+/// Stable merge of three start-sorted block lists; on equal starts `a` precedes
+/// `b` precedes `c`.
+fn merge3_by_start(a: &[Block], b: &[Block], c: &[Block]) -> Vec<Block> {
+    let mut out = Vec::with_capacity(a.len() + b.len() + c.len());
+    let (mut i, mut j, mut l) = (0, 0, 0);
+    loop {
+        let ka = a.get(i).map_or(u32::MAX, |x| x.start);
+        let kb = b.get(j).map_or(u32::MAX, |x| x.start);
+        let kc = c.get(l).map_or(u32::MAX, |x| x.start);
+        if i < a.len() && ka <= kb && ka <= kc { out.push(a[i]); i += 1; }
+        else if j < b.len() && kb <= kc       { out.push(b[j]); j += 1; }
+        else if l < c.len()                   { out.push(c[l]); l += 1; }
+        else { break; }
+    }
+    out
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
