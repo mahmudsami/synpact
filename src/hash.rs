@@ -80,18 +80,27 @@ pub(crate) fn block_hash_iter_domain(len: usize, vals: impl Iterator<Item = u64>
     // Seed mixes in both length and domain so that:
     //   • blocks of different lengths can't collide (even with same prefix)
     //   • L1 and L2 occupy disjoint hash spaces
-    let mut h: u64 = (len as u64)
-        .wrapping_mul(0xbf58476d1ce4e5b9)
-        ^ domain;
-    for v in vals {
-        h = h.rotate_left(13).wrapping_add(v);
-        // SplitMix64 avalanche step
-        h ^= h >> 30;
-        h = h.wrapping_mul(0xbf58476d1ce4e5b9);
-        h ^= h >> 27;
-        h = h.wrapping_mul(0x94d049bb133111eb);
-        h ^= h >> 31;
-    }
+    let mut h = block_hash_seed(len, domain);
+    for v in vals { h = block_hash_mix(h, v); }
+    h
+}
+
+/// Initial state of `block_hash_iter_domain` for a block of `len` values.
+#[inline(always)]
+pub(crate) fn block_hash_seed(len: usize, domain: u64) -> u64 {
+    (len as u64).wrapping_mul(0xbf58476d1ce4e5b9) ^ domain
+}
+
+/// Fold one block value into the hash state (`block_hash_iter_domain`'s step).
+#[inline(always)]
+pub(crate) fn block_hash_mix(mut h: u64, v: u64) -> u64 {
+    h = h.rotate_left(13).wrapping_add(v);
+    // SplitMix64 avalanche step
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xbf58476d1ce4e5b9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94d049bb133111eb);
+    h ^= h >> 31;
     h
 }
 
