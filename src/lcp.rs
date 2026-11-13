@@ -663,9 +663,119 @@ pub(crate) struct HierNode {
 /// The full per-read block hierarchy, stored flat: `levels[L]` is every block at
 /// level L (1-indexed; `levels[0]` is an unused placeholder). The top-level blocks
 /// to anchor from are `levels[top_level]`.
+///
+/// Dropping a forest hands its level vectors back to this thread's
+/// `HierScratch`, so the next read's hierarchy is built without allocating.
 pub(crate) struct HierForest {
     pub(crate) levels:    Vec<Vec<HierNode>>,
     pub(crate) top_level: usize,
+}
+
+impl Drop for HierForest {
+    fn drop(&mut self) {
+        let levels = std::mem::take(&mut self.levels);
+        // `try_with`: the thread-local may already be gone during thread exit;
+        // the vectors are then simply freed.
+        let _ = HIER_SCRATCH.try_with(|s| {
+            if let Ok(mut s) = s.try_borrow_mut() { s.recycle(levels); }
+        });
+    }
+}
+
+/// Per-thread buffers reused across reads by `extract_hier_blocks_n`.
+///
+/// A read's hierarchy is a handful of short-lived vectors per level (s-mer
+/// values, membership counts, the level's hashes and nodes); allocating,
+/// zeroing and freeing them for every read and strand was a measurable share of
+/// mapping time (macOS `free` even reads the clock). They only grow to the
+/// longest read a thread has seen.
+#[derive(Default)]
+struct HierScratch {
+    /// L1 units: the syncmers' s-mer values.
+    smer_vals: Vec<u64>,
+    /// Hashes of the current level's blocks — the next level's parse input —
+    /// kept apart from the nodes so they need not be gathered back out of them.
+    hashes:    Vec<u64>,
+    next_hashes: Vec<u64>,
+    /// Per-unit membership counts (see `count_membership`).
+    memb:      Vec<u32>,
+    /// Level vectors of dropped forests, ready for reuse (L1's is popped first).
+    pool:      Vec<Vec<HierNode>>,
+    /// The outer `levels` vector of the last dropped forest.
+    outer:     Vec<Vec<HierNode>>,
+}
+
+impl HierScratch {
+    fn recycle(&mut self, mut levels: Vec<Vec<HierNode>>) {
+        // Highest level first, so that the pool pops L1's (largest) vector first.
+        while let Some(mut v) = levels.pop() {
+            if v.capacity() > 0 { v.clear(); self.pool.push(v); }
+        }
+        if levels.capacity() > self.outer.capacity() { self.outer = levels; }
+    }
+}
+
+thread_local! {
+    static HIER_SCRATCH: std::cell::RefCell<HierScratch> = Default::default();
+}
+
+/// `memb[i]` = number of `blocks` containing unit `i`, for `n` units.
+///
+/// Computed as a prefix sum over +1 at each block start and −1 one past each
+/// end (wrapping u32 arithmetic; every final count is ≥ 0), which needs no
+/// per-unit inner loop over each block's variable (and so mispredicted) length.
+fn count_membership(blocks: &[Block], n: usize, memb: &mut Vec<u32>) {
+    memb.clear();
+    memb.resize(n + 1, 0);
+    // Wrapping on both sides: a slot shared by one block's end and the next
+    // block's start (the usual LCP overlap) passes through u32::MAX.
+    for b in blocks {
+        memb[b.start as usize] = memb[b.start as usize].wrapping_add(1);
+        memb[b.end as usize] = memb[b.end as usize].wrapping_sub(1);
+    }
+    let mut c = 0u32;
+    for m in &mut memb[..n] { c = c.wrapping_add(*m); *m = c; }
+}
+
+/// A block's mass: `Σ_{i ∈ r} term(i)` summed in index order.
+///
+/// Bit-identical to `r.map(term).sum::<f32>()`: every term is > 0, so the
+/// iterator's ±0.0 start value drops out of the first addition, and padding a
+/// short block with −0.0 terms leaves the sum unchanged (x + −0.0 = x exactly).
+/// Blocks of ≤ 3 units (almost all) are thus summed branch-free — all three
+/// terms are evaluated at clamped indices and masked — instead of in a loop
+/// whose length-dependent exit mispredicts.
+#[inline(always)]
+fn block_mass(r: std::ops::Range<usize>, term: impl Fn(usize) -> f32) -> f32 {
+    let len = r.end - r.start;
+    if len <= 3 {
+        let last = r.end - 1;
+        let (t0, t1, t2) = (term(r.start), term((r.start + 1).min(last)), term(last));
+        let t1 = if len >= 2 { t1 } else { -0.0 };
+        let t2 = if len >= 3 { t2 } else { -0.0 };
+        (t0 + t1) + t2
+    } else {
+        r.map(term).sum()
+    }
+}
+
+/// `block_hash_for_level(&vals[r], level_0idx)`, branch-free for blocks of ≤ 3
+/// units: the hash state after 1, 2 and 3 values is always computed (clamping
+/// the value index) and the one matching the length is selected. As with
+/// `block_mass`, this replaces a hard-to-predict variable-length loop; the
+/// blocks' independent hash chains then overlap in the out-of-order window.
+#[inline(always)]
+fn block_hash_range(vals: &[u64], r: std::ops::Range<usize>, level_0idx: usize) -> u64 {
+    let len = r.end - r.start;
+    if len <= 3 {
+        let last = r.end - 1;
+        let h1 = block_hash_mix(block_hash_seed(len, level_domain(level_0idx)), vals[r.start]);
+        let h2 = block_hash_mix(h1, vals[(r.start + 1).min(last)]);
+        let h3 = block_hash_mix(h2, vals[last]);
+        if len == 1 { h1 } else if len == 2 { h2 } else { h3 }
+    } else {
+        block_hash_for_level(&vals[r], level_0idx)
+    }
 }
 
 /// Build the per-read block hierarchy as a flat `HierForest`.
@@ -675,66 +785,87 @@ pub(crate) struct HierForest {
 pub(crate) fn extract_hier_blocks_n(seq: &[u8], k: usize, s: usize, t: usize, num_levels: usize,
                          mode: SeedMode) -> HierForest
 {
-    let empty = || HierForest { levels: vec![Vec::new()], top_level: 0 };
+    HIER_SCRATCH.with(|sc| {
+        let mut sc = sc.borrow_mut();
+        let sc = &mut *sc;
+        let mut levels = std::mem::take(&mut sc.outer);
+        levels.clear();
+        levels.push(Vec::new());   // levels[0]: unused placeholder (level numbers index directly)
+        let top_level = build_hierarchy(sc, &mut levels, seq, k, s, t, num_levels, mode);
+        HierForest { levels, top_level }
+    })
+}
 
+/// `extract_hier_blocks_n` on the thread's scratch: fills `levels[1..]` and
+/// returns the top level built (0 if the read has no blocks).
+fn build_hierarchy(sc: &mut HierScratch, levels: &mut Vec<Vec<HierNode>>,
+                   seq: &[u8], k: usize, s: usize, t: usize, num_levels: usize,
+                   mode: SeedMode) -> usize
+{
     let syncmers = timed(&PROF_SEED, || select_seeds_light(seq, k, s, t, mode));
-    if syncmers.is_empty() { return empty(); }
+    if syncmers.is_empty() { return 0; }
 
-    let smer_vals: Vec<u64> = syncmers.iter().map(|sm| sm.value).collect();
-    let l1_raw = timed(&PROF_L1, || locally_consistent_parsing(&smer_vals));
+    let smer_vals = &mut sc.smer_vals;
+    smer_vals.clear();
+    smer_vals.extend(syncmers.iter().map(|sm| sm.value));
+    let l1_raw = timed(&PROF_L1, || locally_consistent_parsing(smer_vals));
+    if l1_raw.is_empty() { return 0; }
 
     // ── L1 masses ────────────────────────────────────────────────────────────
     // Each syncmer carries mass 1.  A syncmer shared by `m` L1 blocks splits its
     // mass 1/m across them.  A block's mass = sum of its syncmers' shares.
-    let mut sync_membership = vec![0u32; syncmers.len()];
-    for blk in &l1_raw { for i in blk.range() { sync_membership[i] += 1; } }
+    let memb = &mut sc.memb;
+    count_membership(&l1_raw, syncmers.len(), memb);
 
-    let l1: Vec<HierNode> = l1_raw.iter().map(|blk| {
-        let h   = block_hash_for_level(&smer_vals[blk.range()], 0);
+    let mut l1 = sc.pool.pop().unwrap_or_default();
+    l1.reserve(l1_raw.len());
+    let hashes = &mut sc.hashes;
+    hashes.clear();
+    for blk in &l1_raw {
+        let h   = block_hash_range(smer_vals, blk.range(), 0);
         let pos = syncmers[blk.first()].pos;
         let end = syncmers[blk.last()].pos + k as u32;
-        let mass: f32 = blk.range()
-            .map(|i| 1.0 / sync_membership[i] as f32).sum();
-        HierNode { level: 1, hash: h, pos, end, mass, children: Block { start: 0, end: 0 } }
-    }).collect();
-
-    if l1.is_empty() { return empty(); }
-
-    // levels[0] is an unused placeholder so level numbers index directly.
-    let mut levels: Vec<Vec<HierNode>> = vec![Vec::new(), l1];
+        let mass = block_mass(blk.range(), |i| 1.0 / memb[i] as f32);
+        hashes.push(h);
+        l1.push(HierNode { level: 1, hash: h, pos, end, mass, children: Block { start: 0, end: 0 } });
+    }
+    levels.push(l1);
     let mut top_level = 1usize;
 
     // Iteratively build L2, L3, … up to num_levels. Each new node stores its
     // children as indices into the level below — no subtree cloning.
     timed(&PROF_UPPER, || {
         for level_1idx in 2..=num_levels {
-            let cur = &levels[level_1idx - 1];
-            if cur.len() < 2 { break; }
-
-            let cur_hashes: Vec<u64> = cur.iter().map(|b| b.hash).collect();
-            let next_raw = locally_consistent_parsing(&cur_hashes);
+            let cur_hashes = &sc.hashes;
+            if cur_hashes.len() < 2 { break; }
+            let next_raw = locally_consistent_parsing(cur_hashes);
             if next_raw.is_empty() { break; }
 
             // Membership: how many parent blocks each child block belongs to.
-            let mut child_membership = vec![0u32; cur_hashes.len()];
-            for blk in &next_raw { for i in blk.range() { child_membership[i] += 1; } }
+            let memb = &mut sc.memb;
+            count_membership(&next_raw, cur_hashes.len(), memb);
 
-            let new_level: Vec<HierNode> = next_raw.iter().map(|blk| {
-                let h        = block_hash_for_level(&cur_hashes[blk.range()], level_1idx - 1);
+            let cur = &levels[level_1idx - 1];
+            let mut new_level = sc.pool.pop().unwrap_or_default();
+            new_level.reserve(next_raw.len());
+            let next_hashes = &mut sc.next_hashes;
+            next_hashes.clear();
+            for blk in &next_raw {
+                let h        = block_hash_range(cur_hashes, blk.range(), level_1idx - 1);
                 let pos      = cur[blk.first()].pos;
                 let end      = cur[blk.last()].end;
                 // Parent mass = sum of each child's mass / (#parents sharing that child).
-                let mass: f32 = blk.range()
-                    .map(|i| cur[i].mass / child_membership[i] as f32).sum();
-                HierNode { level: level_1idx, hash: h, pos, end, mass, children: *blk }
-            }).collect();
+                let mass = block_mass(blk.range(), |i| cur[i].mass / memb[i] as f32);
+                next_hashes.push(h);
+                new_level.push(HierNode { level: level_1idx, hash: h, pos, end, mass, children: *blk });
+            }
 
             levels.push(new_level);
+            std::mem::swap(&mut sc.hashes, &mut sc.next_hashes);
             top_level = level_1idx;
         }
     });
-
-    HierForest { levels, top_level }
+    top_level
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1064,6 +1195,53 @@ mod lcp_equiv_tests {
             let got = locally_consistent_parsing(&v);
             let want = reference::locally_consistent_parsing(&v);
             assert_eq!(got, want, "iteration {it}, values={v:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod hier_tests {
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            self.0 = x; x
+        }
+    }
+
+    /// The branch-free helpers must agree bit-for-bit with the straightforward
+    /// loops they replace (masses feed anchor weights, hashes the index lookups),
+    /// and the prefix-sum membership with per-unit counting, on real LCP blocks.
+    #[test]
+    fn helpers_match_reference() {
+        let mut rng = Rng(0x0123_4567_89AB_CDEF);
+        let mut memb = Vec::new();
+        for iter in 0..3000 {
+            let n = 1 + (rng.next() % 300) as usize;
+            // Small alphabet now and then, so repeats (long rule-3 blocks) occur.
+            let vals: Vec<u64> = (0..n).map(|_| {
+                let r = rng.next();
+                if iter % 3 == 0 { r % 4 } else { r }
+            }).collect();
+            let blocks = locally_consistent_parsing(&vals);
+
+            let mut naive = vec![0u32; n];
+            for b in &blocks { for i in b.range() { naive[i] += 1; } }
+            count_membership(&blocks, n, &mut memb);
+            assert_eq!(&memb[..n], &naive[..]);
+
+            let masses: Vec<f32> = (0..n).map(|_| 0.1 + (rng.next() % 1000) as f32 / 37.0).collect();
+            for b in &blocks {
+                let lvl = (rng.next() % 10) as usize;
+                assert_eq!(block_hash_range(&vals, b.range(), lvl),
+                           block_hash_for_level(&vals[b.range()], lvl));
+                let want: f32 = b.range().map(|i| masses[i] / naive[i] as f32).sum();
+                let got = block_mass(b.range(), |i| masses[i] / memb[i] as f32);
+                assert_eq!(got.to_bits(), want.to_bits());
+            }
         }
     }
 }
