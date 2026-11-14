@@ -186,8 +186,9 @@ pub(crate) fn map_read_with_occ(fwd: &[SyncmerLight], rc: &[SyncmerLight], index
 /// uncontested. Naturally low when two genomic loci score equally well.
 /// With a near-tie margin (`margin_ppm` > 0, parts per million), a runner-up within
 /// that fraction of the best — an exact tie included — gives MAPQ 0 and the read is
-/// placed. With the margin off, an exact tie is left unmapped.
-pub(crate) fn vote_mapq(votes: u32, second: u32, margin_ppm: u32) -> Option<u8> {
+/// placed. With the margin off, an exact tie is placed at MAPQ 0 if `place_ties`
+/// (`--place-ties`), and left unmapped otherwise.
+pub(crate) fn vote_mapq(votes: u32, second: u32, margin_ppm: u32, place_ties: bool) -> Option<u8> {
     if margin_ppm > 0
         && second as u64 * 1_000_000 >= (1_000_000 - margin_ppm.min(1_000_000) as u64) * votes as u64
     {
@@ -195,6 +196,8 @@ pub(crate) fn vote_mapq(votes: u32, second: u32, margin_ppm: u32) -> Option<u8> 
     }
     if votes > second {
         Some((votes.saturating_sub(second).saturating_mul(60) / votes.max(1)).min(60) as u8)
+    } else if place_ties {
+        Some(0)
     } else {
         None
     }
@@ -214,7 +217,7 @@ pub(crate) fn map_read(fwd: &[u8], index: &GIndex, k: usize, s: usize, t: usize,
             b.mapq = 0;
             return best;
         }
-        if let Some(q) = vote_mapq(b.votes, second_score, mapq0_margin_ppm()) {
+        if let Some(q) = vote_mapq(b.votes, second_score, mapq0_margin_ppm(), place_ties()) {
             b.mapq = q;
             return best;
         }
@@ -229,20 +232,26 @@ mod tests {
     #[test]
     fn vote_mapq_margin() {
         // margin off: the vote-margin MAPQ, exact ties unmapped
-        assert_eq!(vote_mapq(100, 0, 0), Some(60));
-        assert_eq!(vote_mapq(100, 98, 0), Some(1));
-        assert_eq!(vote_mapq(100, 99, 0), Some(0));
-        assert_eq!(vote_mapq(100, 100, 0), None);
+        assert_eq!(vote_mapq(100, 0, 0, false), Some(60));
+        assert_eq!(vote_mapq(100, 98, 0, false), Some(1));
+        assert_eq!(vote_mapq(100, 99, 0, false), Some(0));
+        assert_eq!(vote_mapq(100, 100, 0, false), None);
+        // --place-ties without a margin: only exact ties change (MAPQ 0 instead of unmapped)
+        assert_eq!(vote_mapq(100, 100, 0, true), Some(0));
+        assert_eq!(vote_mapq(100, 98, 0, true), Some(1));
+        assert_eq!(vote_mapq(100, 0, 0, true), Some(60));
         // 5 % margin: runner-up ≥ 95 % of the best → MAPQ 0, exact ties placed
         let m = 50_000;
-        assert_eq!(vote_mapq(100, 100, m), Some(0));
-        assert_eq!(vote_mapq(100, 95, m), Some(0));
-        assert_eq!(vote_mapq(100, 94, m), Some(3));
-        assert_eq!(vote_mapq(1000, 951, m), Some(0));
-        assert_eq!(vote_mapq(1000, 949, m), Some(3));
-        assert_eq!(vote_mapq(100, 0, m), Some(60));
+        for t in [false, true] {
+            assert_eq!(vote_mapq(100, 100, m, t), Some(0));
+            assert_eq!(vote_mapq(100, 95, m, t), Some(0));
+            assert_eq!(vote_mapq(100, 94, m, t), Some(3));
+            assert_eq!(vote_mapq(1000, 951, m, t), Some(0));
+            assert_eq!(vote_mapq(1000, 949, m, t), Some(3));
+            assert_eq!(vote_mapq(100, 0, m, t), Some(60));
+        }
         // no overflow on large vote totals
-        assert_eq!(vote_mapq(u32::MAX, u32::MAX - 1, m), Some(0));
+        assert_eq!(vote_mapq(u32::MAX, u32::MAX - 1, m, false), Some(0));
     }
 }
 

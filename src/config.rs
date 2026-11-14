@@ -65,6 +65,16 @@ pub(crate) fn set_mapq0_margin(f: f64) { let _ = MAPQ0_MARGIN_CELL.set((f * 1e6)
 
 pub(crate) fn mapq0_margin_ppm() -> u32 { *MAPQ0_MARGIN_CELL.get_or_init(|| 0) }
 
+/// Place exact ties (`--place-ties`, default off): a read whose best locus ties with a
+/// genuinely different locus is reported at its best locus (the first heaviest window)
+/// with MAPQ 0, instead of being left unmapped. Implied by `--mapq0-margin` > 0.
+/// Set once from the CLI.
+pub(crate) static PLACE_TIES_CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub(crate) fn set_place_ties(on: bool) { let _ = PLACE_TIES_CELL.set(on); }
+
+pub(crate) fn place_ties() -> bool { *PLACE_TIES_CELL.get_or_init(|| false) }
+
 /// Near-tie tiebreak (`--tiebreak votes|floor|chain`, default votes): which of the
 /// near-tied loci (within `--mapq0-margin`) is reported. `Votes` keeps the heaviest
 /// window (the first found on an exact tie); `Floor` re-ranks them by floor-level

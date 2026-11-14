@@ -54,6 +54,9 @@ OPTIONS:
   --mapq0-margin F near-tie margin (default 0 = off, 0 ≤ F < 1). A read whose
                    runner-up locus scores ≥ (1 − F) × the best is placed with
                    MAPQ 0, exact ties included (otherwise they stay unmapped).
+  --place-ties     place a read whose best locus ties with a different locus at
+                   MAPQ 0 (the first heaviest), instead of leaving it unmapped.
+                   Default off; implied by --mapq0-margin > 0.
   --tiebreak R     which near-tied locus to report (with --mapq0-margin > 0):
                    votes (default) = the heaviest; floor = the most support from
                    floor-level (--min-level) blocks, looked up for every block;
@@ -102,6 +105,8 @@ fn main() {
     assert!(max_lvl() >= min_lvl(),
         "--max-level ({}) must be ≥ --min-level ({})", max_lvl(), min_lvl());
 
+    // --place-ties (default off): exact ties are placed at MAPQ 0 instead of left unmapped.
+    if args.iter().any(|a| a == "--place-ties") { set_place_ties(true); }
     // --mapq0-margin F (default 0 = off): near-ties (runner-up ≥ (1 − F) × best) get MAPQ 0.
     if let Some(p) = args.iter().position(|a| a == "--mapq0-margin") {
         let f: f64 = args.get(p + 1).and_then(|v| v.parse().ok())
