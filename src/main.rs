@@ -51,6 +51,16 @@ OPTIONS:
                    too-repetitive (default 10000). Higher surfaces more anchors in
                    segmental-dup regions (better accuracy); very large values can
                    slow highly repetitive genomes.
+  --mapq0-margin F near-tie margin (default 0 = off, 0 ≤ F < 1). A read whose
+                   runner-up locus scores ≥ (1 − F) × the best is placed with
+                   MAPQ 0, exact ties included (otherwise they stay unmapped).
+  --tiebreak R     which near-tied locus to report (with --mapq0-margin > 0):
+                   votes (default) = the heaviest; floor = the most support from
+                   floor-level (--min-level) blocks, looked up for every block;
+                   chain = the highest colinear chaining score of its anchors.
+  --span-switch F,R  among loci with ≥ F × the best's votes, report the one whose
+                   anchors span the most of the read if that span is ≥ R × the
+                   vote-best's (MAPQ 0). Default off. E.g. 0.3,1.25.
 
 Recommended HiFi preset (the default): --k 19 --s 10
 ";
@@ -91,6 +101,32 @@ fn main() {
     assert!(max_lvl() >= 1, "--max-level must be ≥ 1");
     assert!(max_lvl() >= min_lvl(),
         "--max-level ({}) must be ≥ --min-level ({})", max_lvl(), min_lvl());
+
+    // --mapq0-margin F (default 0 = off): near-ties (runner-up ≥ (1 − F) × best) get MAPQ 0.
+    if let Some(p) = args.iter().position(|a| a == "--mapq0-margin") {
+        let f: f64 = args.get(p + 1).and_then(|v| v.parse().ok())
+            .expect("--mapq0-margin requires a number");
+        assert!((0.0..1.0).contains(&f), "--mapq0-margin ({f}) must be ≥ 0 and < 1");
+        set_mapq0_margin(f);
+    }
+    // --span-switch F,R (default off): prefer the locus spanning ≥ R × more of the read
+    // among those with ≥ F × the best's votes.
+    if let Some(p) = args.iter().position(|a| a == "--span-switch") {
+        let v: Vec<f64> = args.get(p + 1).map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect())
+            .unwrap_or_default();
+        assert!(v.len() == 2 && (0.0..=1.0).contains(&v[0]) && v[1] >= 1.0,
+            "--span-switch needs F,R with 0 ≤ F ≤ 1 and R ≥ 1, e.g. 0.3,1.25");
+        set_span_switch(v[0], v[1]);
+    }
+    // --tiebreak votes|floor|chain (default votes): which near-tied locus is reported.
+    if let Some(p) = args.iter().position(|a| a == "--tiebreak") {
+        match args.get(p + 1).map(|s| s.as_str()) {
+            Some("votes") => set_tiebreak(Tiebreak::Votes),
+            Some("floor") => set_tiebreak(Tiebreak::Floor),
+            Some("chain") => set_tiebreak(Tiebreak::Chain),
+            other => panic!("--tiebreak must be votes, floor or chain, got {other:?}"),
+        }
+    }
 
     // --batch-mb N (default 128): per-batch read-sequence budget in MiB.
     if let Some(v) = args.iter().position(|a| a == "--batch-mb")

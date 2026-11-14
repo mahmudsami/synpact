@@ -268,6 +268,136 @@ pub(crate) fn vote_locus(anchors: &mut Vec<Anchor>, buf: &mut VoteBuf)
     (Some((best_chr, off, best_sum)), second)
 }
 
+/// A candidate locus of the near-tie tiebreak (`--tiebreak floor`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Candidate {
+    pub(crate) chr:   u8,
+    /// Representative reference offset, as vote_locus: the diagonal of the window's
+    /// smallest-q_pos anchor.
+    pub(crate) off:   i64,
+    pub(crate) votes: u32,
+    /// The window's anchors: `anchors[lo..=hi]` of the slice it was found in.
+    pub(crate) lo:    usize,
+    pub(crate) hi:    usize,
+    /// Read span of the window's anchors: last − first anchor start in the read.
+    pub(crate) q_span: u32,
+}
+
+/// Near-tie candidates: up to `k` diagonal windows (≤ VOTE_BAND wide, as vote_locus)
+/// with at least `min_votes`, at pairwise distinct loci (window keys more than 2·VOTE_BAND
+/// apart), heaviest first and, among equal weights, leftmost first — so whenever
+/// vote_locus's locus qualifies it comes first, with the same offset and votes.
+/// `anchors` must be sorted by key, as vote_locus leaves them.
+pub(crate) fn close_candidates(anchors: &[Anchor], min_votes: u32, k: usize) -> Vec<Candidate> {
+    let mut wins: Vec<(u32, usize, usize)> = Vec::new();
+    let (mut lo, mut sum) = (0usize, 0u32);
+    for hi in 0..anchors.len() {
+        sum = sum.saturating_add(anchors[hi].weight);
+        while anchors[hi].key - anchors[lo].key > VOTE_BAND as u64 {
+            sum = sum.saturating_sub(anchors[lo].weight);
+            lo += 1;
+        }
+        // Every weight is ≥ 1, so a window's sum peaks at the last anchor of a key group.
+        let group_end = hi + 1 == anchors.len() || anchors[hi + 1].key != anchors[hi].key;
+        if group_end && sum >= min_votes { wins.push((sum, lo, hi)); }
+    }
+    wins.sort_unstable_by(|x, y| y.0.cmp(&x.0).then(x.1.cmp(&y.1)));
+    let mut picked: Vec<(u32, usize, usize)> = Vec::new();
+    for w in wins {
+        if picked.len() == k { break; }
+        let key = anchors[w.2].key;
+        if picked.iter().all(|p| anchors[p.2].key.abs_diff(key) > 2 * VOTE_BAND as u64) {
+            picked.push(w);
+        }
+    }
+    picked.into_iter().map(|(votes, lo, hi)| {
+        let win = &anchors[lo..=hi];
+        let (mut off, mut min_q, mut max_q) = (win[0].diag(), u32::MAX, 0u32);
+        for a in win {
+            if a.q_pos < min_q { min_q = a.q_pos; off = a.diag(); }
+            max_q = max_q.max(a.q_pos);
+        }
+        Candidate { chr: win[0].chr(), off, votes, lo, hi, q_span: max_q - min_q }
+    }).collect()
+}
+
+/// Predecessors tried per anchor by chain_score (as minimap2's -h default).
+const CHAIN_MAX_PRED: usize = 50;
+
+/// Cost of a diagonal shift of `g` bp between consecutive chained anchors, in vote
+/// units: minimap2's gap cost 0.01·k̄·g + 0.5·log2 g for a seed scoring k̄, scaled to
+/// synpact's weights (one syncmer's mass, ×16, plays the part of one seed).
+#[inline]
+fn chain_gap_cost(g: i64) -> f64 {
+    if g == 0 { return 0.0; }
+    let g = g as f64;
+    0.01 * 16.0 * g + 0.5 * (16.0 / 19.0) * g.log2()
+}
+
+/// Colinear chaining score of one candidate window's anchors (near-tie tiebreak):
+/// the best chain of anchors increasing in both read and reference position, scored
+/// as the chained weights minus a cost per diagonal shift between consecutive anchors
+/// (chain_gap_cost), as minimap2 chains its seeds.
+///
+/// Voting sums a window's weights whatever their diagonals within VOTE_BAND, and a
+/// block's hash ignores the spacing of its syncmers, so a repeat copy that differs
+/// from the read's origin by indels can collect the same votes. Its anchors then lie
+/// on shifted diagonals, which the chain pays for; the read's own indel errors shift
+/// every copy alike.
+pub(crate) fn chain_score(win: &[Anchor]) -> f64 {
+    let mut a: Vec<(u32, i64, u32)> = win.iter().map(|x| (x.q_pos, x.diag(), x.weight)).collect();
+    a.sort_unstable_by_key(|&(q, d, _)| (q, d + q as i64));
+    let mut f = vec![0.0f64; a.len()];
+    let mut best = 0.0f64;
+    for i in 0..a.len() {
+        let (qi, di, wi) = a[i];
+        let ri = di + qi as i64;
+        let mut fi = wi as f64;
+        for j in (i.saturating_sub(CHAIN_MAX_PRED)..i).rev() {
+            let (qj, dj, _) = a[j];
+            if qj >= qi || dj + qj as i64 >= ri { continue; }
+            fi = fi.max(f[j] + wi as f64 - chain_gap_cost((di - dj).abs()));
+        }
+        f[i] = fi;
+        best = best.max(fi);
+    }
+    best
+}
+
+/// Floor-level support of candidate loci on one read strand (near-tie tiebreak): for
+/// each (chr, diagonal) in `cands`, the summed mass (×16, as anchor weights) of the
+/// read's floor-level blocks (`--min-level`) that the index holds on that chromosome
+/// within VOTE_BAND of the diagonal.
+///
+/// Unlike collect_anchors, every floor block is looked up, whether or not a coarser
+/// block above it hit. collect_anchors stops descending where a coarse block hits
+/// anywhere, so when a coarse block hits one copy of a repeat but not the other (the
+/// other copy's coarse parse differs, or it differs from the read inside the block),
+/// the other copy gets no credit for the region even where it matches the read at
+/// the finer level. Floor blocks are short, so their parse depends on little context
+/// and one copy's support exceeds another's only where the read matches it better.
+pub(crate) fn floor_support(syncmers: &[SyncmerLight], index: &GIndex, k: usize,
+                            max_occ: usize, max_occ_l1: usize, cands: &[(u8, i64)]) -> Vec<u64> {
+    let mut sup = vec![0u64; cands.len()];
+    if cands.is_empty() { return sup; }
+    let top = index.max_level().min(max_lvl());
+    let forest = extract_hier_blocks_n(syncmers, k, top);
+    let floor = min_lvl().max(1);
+    if forest.top_level < floor || forest.levels.len() <= floor { return sup; }
+    for block in &forest.levels[floor] {
+        let mocc = max_occ_for_level(block.level, max_occ, max_occ_l1);
+        let hits = index.lookup(block.level, block.hash, mocc);
+        if hits.is_empty() { continue; }
+        let w = (block.mass * 16.0).round().max(1.0) as u64;
+        for (s, &(chr, off)) in sup.iter_mut().zip(cands) {
+            if hits.iter().any(|(c, r)| c == chr && (r as i64 - block.pos as i64 - off).abs() <= VOTE_BAND) {
+                *s += w;
+            }
+        }
+    }
+    sup
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +489,48 @@ mod tests {
             }
             let mut anchors: Vec<Anchor> = raw.iter().map(|&(c, q, r, w)| Anchor::new(c, q, r, w)).collect();
             assert_eq!(vote_locus(&mut anchors, &mut buf), vote_reference(raw), "iter {iter}");
+            // The near-tie candidates start with vote_locus's own locus.
+            if let (Some((chr, off, votes)), false) = (vote_locus(&mut anchors, &mut buf).0, saturate) {
+                let c = close_candidates(&anchors, votes, 4);
+                assert_eq!((c[0].chr, c[0].off, c[0].votes), (chr, off, votes), "iter {iter}");
+            }
         }
+    }
+
+    /// Two loci with equal votes are both candidates, at distinct loci, vote_locus's first;
+    /// a locus below min_votes is not.
+    #[test]
+    fn close_candidates_loci() {
+        let mut a: Vec<Anchor> = Vec::new();
+        for q in 0..10u32 { a.push(Anchor::new(1, q * 100, 1_000_000 + q * 100, 10)); }
+        for q in 0..10u32 { a.push(Anchor::new(2, q * 100, 5_000_000 + q * 100, 10)); }
+        for q in 0..5u32 { a.push(Anchor::new(3, q * 100, 7_000_000 + q * 100, 10)); }
+        let mut buf = VoteBuf::default();
+        let (top, second) = vote_locus(&mut a, &mut buf);
+        let (chr, off, votes) = top.unwrap();
+        assert_eq!((votes, second), (100, 100));
+        let c = close_candidates(&a, 95, 8);
+        assert_eq!(c.len(), 2);
+        assert_eq!((c[0].chr, c[0].off, c[0].votes), (chr, off, votes));
+        assert_eq!((c[1].chr, c[1].votes), (2, 100));
+        assert_eq!((c[0].q_span, c[1].q_span), (900, 900));
+        assert_eq!(close_candidates(&a, 50, 8).iter().find(|x| x.chr == 3).map(|x| x.q_span), Some(400));
+        assert!(close_candidates(&a, 101, 8).is_empty());
+    }
+
+    /// Equal votes, but one copy's anchors shift diagonal by 7 bp halfway (an indel
+    /// relative to the read): the colinear copy chains higher; a lone off-chain anchor
+    /// (reference position going backwards) is left out of the chain.
+    #[test]
+    fn chain_score_prefers_colinear() {
+        let straight: Vec<Anchor> = (0..20u32).map(|q| Anchor::new(1, q * 100, 1_000_000 + q * 100, 16)).collect();
+        let shifted: Vec<Anchor> = (0..20u32)
+            .map(|q| Anchor::new(1, q * 100, 2_000_000 + q * 100 + if q >= 10 { 7 } else { 0 }, 16)).collect();
+        let (s, t) = (chain_score(&straight), chain_score(&shifted));
+        assert_eq!(s, 320.0);
+        assert!((t - (320.0 - chain_gap_cost(7))).abs() < 1e-9, "{t}");
+        let mut back = straight.clone();
+        back.push(Anchor::new(1, 1950, 1_000_000 + 10, 16));
+        assert_eq!(chain_score(&back), 320.0);
     }
 }
