@@ -34,6 +34,14 @@ USAGE:
   Map HiFi reads against a prebuilt index (or a FASTA):
     synpact --map <reads.fq[.gz]> <index.idx|genome.fa[.gz]> -o <out.paf> [options]
 
+PRESETS:
+  --preset fast      --max-level 6 --min-level 3 --place-ties
+  --preset accurate  --max-level 5 --min-level 2 --mapq0-margin 0.05 --span-switch 0.3,1.1
+                   A preset only fills options not given on the command line. Give
+                   the same preset to --build-index and --map (it sets the index's
+                   levels). Without a preset synpact runs as before: L6→3, exact
+                   ties unmapped.
+
 OPTIONS:
   --k N            k-mer length          (default 19, must be ≤ 32)
   --s N            syncmer s-mer length  (default 10; density = 1/(k-s+1))
@@ -51,6 +59,19 @@ OPTIONS:
                    too-repetitive (default 10000). Higher surfaces more anchors in
                    segmental-dup regions (better accuracy); very large values can
                    slow highly repetitive genomes.
+  --mapq0-margin F near-tie margin (default 0 = off, 0 ≤ F < 1). A read whose
+                   runner-up locus scores ≥ (1 − F) × the best is placed with
+                   MAPQ 0, exact ties included (otherwise they stay unmapped).
+  --place-ties     place a read whose best locus ties with a different locus at
+                   MAPQ 0 (the first heaviest), instead of leaving it unmapped.
+                   Default off; implied by --mapq0-margin > 0.
+  --tiebreak R     which near-tied locus to report (with --mapq0-margin > 0):
+                   votes (default) = the heaviest; floor = the most support from
+                   floor-level (--min-level) blocks, looked up for every block;
+                   chain = the highest colinear chaining score of its anchors.
+  --span-switch F,R  among loci with ≥ F × the best's votes, report the one whose
+                   anchors span the most of the read if that span is ≥ R × the
+                   vote-best's (MAPQ 0). Default off. E.g. 0.3,1.1.
 
 Recommended HiFi preset (the default): --k 19 --s 10
 ";
@@ -73,6 +94,21 @@ fn main() {
     // HiFi always uses open-syncmer seeds with the full k-mer as the LCP atom.
     let mode = SeedMode::Syncmer;
 
+    // --preset fast|accurate: fills the level, tie, margin and switch options the command
+    // line leaves unset (an explicit flag always wins). Set before the flags below, whose
+    // cells are set once; the preset skips every option that has its own flag.
+    if let Some(p) = args.iter().position(|a| a == "--preset") {
+        let name = args.get(p + 1).map(|s| s.as_str()).unwrap_or("");
+        let ps = preset_settings(name)
+            .unwrap_or_else(|| panic!("--preset must be fast or accurate, got {name:?}"));
+        let given = |f: &str| args.iter().any(|a| a == f);
+        if !given("--max-level") { set_max_lvl(ps.max_level); }
+        if !given("--min-level") { set_min_lvl(ps.min_level); }
+        if ps.place_ties { set_place_ties(true); }
+        if ps.mapq0_margin > 0.0 && !given("--mapq0-margin") { set_mapq0_margin(ps.mapq0_margin); }
+        if let (Some((f, r)), false) = (ps.span_switch, given("--span-switch")) { set_span_switch(f, r); }
+    }
+
     // --min-level N (default 3): the single floor used for both index build and
     // mapping. Blocks below it are neither stored nor used.
     if let Some(v) = args.iter().position(|a| a == "--min-level")
@@ -91,6 +127,34 @@ fn main() {
     assert!(max_lvl() >= 1, "--max-level must be ≥ 1");
     assert!(max_lvl() >= min_lvl(),
         "--max-level ({}) must be ≥ --min-level ({})", max_lvl(), min_lvl());
+
+    // --place-ties (default off): exact ties are placed at MAPQ 0 instead of left unmapped.
+    if args.iter().any(|a| a == "--place-ties") { set_place_ties(true); }
+    // --mapq0-margin F (default 0 = off): near-ties (runner-up ≥ (1 − F) × best) get MAPQ 0.
+    if let Some(p) = args.iter().position(|a| a == "--mapq0-margin") {
+        let f: f64 = args.get(p + 1).and_then(|v| v.parse().ok())
+            .expect("--mapq0-margin requires a number");
+        assert!((0.0..1.0).contains(&f), "--mapq0-margin ({f}) must be ≥ 0 and < 1");
+        set_mapq0_margin(f);
+    }
+    // --span-switch F,R (default off): prefer the locus spanning ≥ R × more of the read
+    // among those with ≥ F × the best's votes.
+    if let Some(p) = args.iter().position(|a| a == "--span-switch") {
+        let v: Vec<f64> = args.get(p + 1).map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect())
+            .unwrap_or_default();
+        assert!(v.len() == 2 && (0.0..=1.0).contains(&v[0]) && v[1] >= 1.0,
+            "--span-switch needs F,R with 0 ≤ F ≤ 1 and R ≥ 1, e.g. 0.3,1.25");
+        set_span_switch(v[0], v[1]);
+    }
+    // --tiebreak votes|floor|chain (default votes): which near-tied locus is reported.
+    if let Some(p) = args.iter().position(|a| a == "--tiebreak") {
+        match args.get(p + 1).map(|s| s.as_str()) {
+            Some("votes") => set_tiebreak(Tiebreak::Votes),
+            Some("floor") => set_tiebreak(Tiebreak::Floor),
+            Some("chain") => set_tiebreak(Tiebreak::Chain),
+            other => panic!("--tiebreak must be votes, floor or chain, got {other:?}"),
+        }
+    }
 
     // --batch-mb N (default 128): per-batch read-sequence budget in MiB.
     if let Some(v) = args.iter().position(|a| a == "--batch-mb")

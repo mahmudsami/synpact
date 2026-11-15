@@ -37,9 +37,26 @@ lowers peak memory for the indexing step.
 synpact --map reads.fq.gz genome.fa.gz -o out.paf
 ```
 
+### 3. Presets
+```sh
+synpact --build-index genome.fa.gz genome.idx --preset accurate --threads 8
+synpact --map reads.fq.gz genome.idx -o out.paf --preset accurate --threads 8
+```
+| Preset | Same as | Use |
+|--------|---------|-----|
+| `fast` | `--max-level 6 --min-level 3 --place-ties` | coarse levels only: fast, few confident errors; exact ties reported at MAPQ 0 |
+| `accurate` | `--max-level 5 --min-level 2 --mapq0-margin 0.05 --span-switch 0.3,1.1` | one level finer; near-ties reported at MAPQ 0, and a read that a longer locus explains better than the vote-best is placed there |
+
+A preset only fills options that are not on the command line, so an explicit flag
+overrides it (e.g. `--preset accurate --span-switch 0.3,1.25`). It also sets the
+index's levels, so build the index with the same preset (or the same
+`--max-level` / `--min-level`) you map with. Without a preset synpact runs as before:
+L6→3, exact ties left unmapped.
+
 ### Options
 | Flag | Default | Meaning |
 |------|---------|---------|
+| `--preset NAME` | none | `fast` or `accurate` (see Presets) |
 | `--k N` | 19 | k-mer (syncmer) length; must be ≤ 32 and > `--s` |
 | `--s N` | 10 | syncmer s-mer length (density ≈ 1/(k−s+1)) |
 | `--threads N` | all cores | worker threads |
@@ -47,6 +64,10 @@ synpact --map reads.fq.gz genome.fa.gz -o out.paf
 | `--max-level N` | 6 | highest block level both built into the index and used to anchor reads (one unified ceiling, ≥ `--min-level`); mapping starts at min(N, the index's top level) and falls back down to `--min-level` |
 | `--max-occ N` | 10000 | max genomic occurrences for an L2/L3 block before it is skipped as too-repetitive; higher levels scale this down, the L1 cap scales it to 2/5 |
 | `--batch-mb N` | 128 | per-batch read-sequence budget (MiB; one batch is mapped while the next is read); keeps peak memory independent of read length. `0` = unbounded |
+| `--place-ties` | off | report a read whose best locus ties with a different locus at MAPQ 0 (the first heaviest locus) instead of leaving it unmapped |
+| `--mapq0-margin F` | 0 (off) | a read whose runner-up locus has ≥ (1 − F) × the best's votes is reported at MAPQ 0; implies `--place-ties`. `0 ≤ F < 1` |
+| `--span-switch F,R` | off | among the loci with ≥ F × the best's votes, report the one whose anchors span ≥ R × more of the read than the vote-best's (MAPQ 0) |
+| `--tiebreak R` | `votes` | experimental: which near-tied locus (within `--mapq0-margin`) is reported — `votes` (the heaviest), `floor` (most floor-level support), `chain` (best colinear chain of anchors) |
 
 The middle s-mer offset `t = (k − s) / 2` is derived from `--k` and `--s`.
 
@@ -71,13 +92,13 @@ The crate is split into one module per pipeline stage:
 | Module | Responsibility |
 |--------|----------------|
 | `main.rs` | CLI parsing and entry point |
-| `config.rs` | runtime flags (`--min-level`, `--max-level`, `--batch-mb`), per-stage profiling, shared helpers |
+| `config.rs` | runtime flags (`--min-level`, `--max-level`, `--batch-mb`, the tie / margin / switch options) and presets, per-stage profiling, shared helpers |
 | `hash.rs` | rolling DNA hash, k-mer encoding, per-level block hashing |
 | `syncmer.rs` | open-syncmer selection, `SeedMode` |
 | `lcp.rs` | locally-consistent parsing → `Block` / `HierForest` hierarchy, mass accounting |
 | `index.rs` | `GIndex` build / serialise / load, FASTA streaming, occurrence caps |
 | `fastq.rs` | FASTQ reader, reverse-complement |
-| `chain.rs` | anchor collection from the hierarchy, diagonal-voting locus selection |
+| `chain.rs` | anchor collection from the hierarchy, diagonal-voting locus selection, near-tie candidates and their read span |
 | `map.rs` | per-read mapping, MAPQ, PAF output, the mapping driver |
 
 ## Notes & limitations
@@ -94,7 +115,9 @@ The crate is split into one module per pipeline stage:
   lower without rebuilding.
 - Placement is locus-only: the output is a position and MAPQ, not a base-level
   alignment. Reads in genuinely ambiguous regions (segmental duplications,
-  acrocentric paralogs, tandem-repeat arrays) are reported at low MAPQ.
+  acrocentric paralogs, tandem-repeat arrays) are reported at low MAPQ; with
+  `--place-ties` (both presets) an exactly tied read is reported at MAPQ 0 rather
+  than left unmapped.
 
 
 ## Citation

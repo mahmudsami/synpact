@@ -55,6 +55,89 @@ pub(crate) fn set_max_lvl(v: usize) { let _ = MAX_LVL_CELL.set(v); }
 
 pub(crate) fn max_lvl() -> usize { *MAX_LVL_CELL.get_or_init(|| crate::index::MAX_LEVELS) }
 
+/// Near-tie margin, in parts per million of the best locus's votes (`--mapq0-margin F`,
+/// default 0 = off). When it is on, a read whose runner-up locus scores at least
+/// (1 − F) × the best is placed at its best locus with MAPQ 0, exact ties included
+/// (which are otherwise left unmapped). Set once from the CLI.
+pub(crate) static MAPQ0_MARGIN_CELL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+pub(crate) fn set_mapq0_margin(f: f64) { let _ = MAPQ0_MARGIN_CELL.set((f * 1e6).round() as u32); }
+
+pub(crate) fn mapq0_margin_ppm() -> u32 { *MAPQ0_MARGIN_CELL.get_or_init(|| 0) }
+
+/// Place exact ties (`--place-ties`, default off): a read whose best locus ties with a
+/// genuinely different locus is reported at its best locus (the first heaviest window)
+/// with MAPQ 0, instead of being left unmapped. Implied by `--mapq0-margin` > 0.
+/// Set once from the CLI.
+pub(crate) static PLACE_TIES_CELL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+pub(crate) fn set_place_ties(on: bool) { let _ = PLACE_TIES_CELL.set(on); }
+
+pub(crate) fn place_ties() -> bool { *PLACE_TIES_CELL.get_or_init(|| false) }
+
+/// The settings of a named preset (`--preset NAME`). A preset only fills the options the
+/// command line leaves unset; an explicit flag always wins.
+///   fast      L6→3, exact ties placed at MAPQ 0: --max-level 6 --min-level 3 --place-ties
+///   accurate  L5→2, near-tie margin 5 % and read-span switch 0.3,1.1:
+///             --max-level 5 --min-level 2 --mapq0-margin 0.05 --span-switch 0.3,1.1
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Preset {
+    pub(crate) max_level:    usize,
+    pub(crate) min_level:    usize,
+    pub(crate) place_ties:   bool,
+    pub(crate) mapq0_margin: f64,                 // 0 = off
+    pub(crate) span_switch:  Option<(f64, f64)>,  // (F, R)
+}
+
+pub(crate) fn preset_settings(name: &str) -> Option<Preset> {
+    match name {
+        "fast" => Some(Preset { max_level: 6, min_level: 3, place_ties: true, mapq0_margin: 0.0, span_switch: None }),
+        "accurate" => Some(Preset { max_level: 5, min_level: 2, place_ties: true, mapq0_margin: 0.05,
+                                    span_switch: Some((0.3, 1.1)) }),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presets() {
+        let f = preset_settings("fast").unwrap();
+        assert_eq!((f.max_level, f.min_level, f.place_ties, f.mapq0_margin, f.span_switch), (6, 3, true, 0.0, None));
+        let a = preset_settings("accurate").unwrap();
+        assert_eq!((a.max_level, a.min_level, a.mapq0_margin, a.span_switch), (5, 2, 0.05, Some((0.3, 1.1))));
+        assert!(preset_settings("default").is_none());
+    }
+}
+
+/// Near-tie tiebreak (`--tiebreak votes|floor|chain`, default votes): which of the
+/// near-tied loci (within `--mapq0-margin`) is reported. `Votes` keeps the heaviest
+/// window (the first found on an exact tie); `Floor` re-ranks them by floor-level
+/// support (chain::floor_support); `Chain` by colinear chaining score
+/// (chain::chain_score). Set once from the CLI.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Tiebreak { Votes, Floor, Chain }
+
+pub(crate) static TIEBREAK_CELL: std::sync::OnceLock<Tiebreak> = std::sync::OnceLock::new();
+
+pub(crate) fn set_tiebreak(t: Tiebreak) { let _ = TIEBREAK_CELL.set(t); }
+
+pub(crate) fn tiebreak() -> Tiebreak { *TIEBREAK_CELL.get_or_init(|| Tiebreak::Votes) }
+
+/// Read-span switch (`--span-switch F,R`, default off): when the runner-up has at
+/// least F × the best's votes, the loci with at least F × the best's votes on both
+/// strands are compared by how much of the read their anchors span (first to last
+/// anchor); the widest is reported instead of the vote-best if its span is at least
+/// R × the vote-best's, at MAPQ 0. Stored as (F in parts per million, R). Set once
+/// from the CLI.
+pub(crate) static SPAN_SWITCH_CELL: std::sync::OnceLock<Option<(u32, f64)>> = std::sync::OnceLock::new();
+
+pub(crate) fn set_span_switch(f: f64, r: f64) { let _ = SPAN_SWITCH_CELL.set(Some(((f * 1e6).round() as u32, r))); }
+
+pub(crate) fn span_switch() -> Option<(u32, f64)> { *SPAN_SWITCH_CELL.get_or_init(|| None) }
+
 /// Per-batch read-sequence budget in MiB (`--batch-mb N`, default 128). Reads are
 /// buffered until this many bytes of sequence accumulate, then mapped in parallel
 /// while the next batch is read (so two batches are resident).

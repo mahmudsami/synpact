@@ -74,16 +74,23 @@ pub(crate) struct MapResult {
 /// genuinely different (different chromosome, or offset > CLUSTER_WINDOW).
 pub(crate) fn map_read_with_occ(fwd: &[SyncmerLight], rc: &[SyncmerLight], index: &GIndex,
                      k: usize, max_occ: usize, max_occ_l1: usize)
-    -> (Option<MapResult>, u32)
+    -> (Option<MapResult>, u32, bool)
 {
+    let margin_ppm = mapq0_margin_ppm();
+    let mode = tiebreak();
+    let tiebreak = margin_ppm > 0 && mode != Tiebreak::Votes;
+    let span = span_switch();
     let mut best: Option<MapResult> = None;
     let mut second_score: u32 = 0;
     let mut vote_buf = VoteBuf::default();   // vote_locus scratch, shared by both strands
+    // Both strands' anchors, sorted by vote_locus, kept for the near-tie tiebreak.
+    let mut kept: Vec<Vec<Anchor>> = Vec::new();
 
     for (seq, strand) in [(&fwd[..], true), (&rc[..], false)] {
         let mut anchors = collect_anchors(seq, index, k, max_occ, max_occ_l1);
         let (top, second_here) = timed(&PROF_SELECT, || vote_locus(&mut anchors, &mut vote_buf));
         second_score = second_score.max(second_here);
+        if tiebreak || span.is_some() { kept.push(anchors); }
 
         if let Some((chr, pos, score)) = top {
             let candidate = MapResult { chr, pos, strand, votes: score, mapq: 0 };
@@ -101,28 +108,151 @@ pub(crate) fn map_read_with_occ(fwd: &[SyncmerLight], rc: &[SyncmerLight], index
             }
         }
     }
-    (best, second_score)
+
+    // Near-tie tiebreak (`--tiebreak floor|chain`): when the runner-up is within the
+    // margin, the loci within it on both strands (close_candidates) are re-ranked by
+    // floor-level support or by chaining score; the highest wins, then most votes,
+    // then the vote-best. The read is reported at MAPQ 0 either way (vote_mapq).
+    if let (true, Some(b)) = (tiebreak, &best) {
+        let min_votes = ((1_000_000 - margin_ppm.min(1_000_000) as u64) * b.votes as u64)
+            .div_ceil(1_000_000).max(1) as u32;
+        if second_score >= min_votes {
+            // (strand, candidate, tiebreak score, is the vote-best)
+            let mut pick: Option<(bool, Candidate, f64, bool)> = None;
+            for (anchors, (syncmers, strand)) in kept.iter().zip([(fwd, true), (rc, false)]) {
+                let cands = close_candidates(anchors, min_votes, 8);
+                let score: Vec<f64> = match mode {
+                    Tiebreak::Floor => {
+                        let keys: Vec<(u8, i64)> = cands.iter().map(|c| (c.chr, c.off)).collect();
+                        floor_support(syncmers, index, k, max_occ, max_occ_l1, &keys)
+                            .into_iter().map(|s| s as f64).collect()
+                    }
+                    _ => cands.iter().map(|c| chain_score(&anchors[c.lo..=c.hi])).collect(),
+                };
+                for (c, s) in cands.into_iter().zip(score) {
+                    let is_best = strand == b.strand && c.chr == b.chr && c.off == b.pos;
+                    let better = match &pick {
+                        None => true,
+                        Some((_, p, ps, pb)) =>
+                            s > *ps || (s == *ps && (c.votes, is_best) > (p.votes, *pb)),
+                    };
+                    if better { pick = Some((strand, c, s, is_best)); }
+                }
+            }
+            if let Some((strand, c, _, false)) = pick {
+                best = Some(MapResult { chr: c.chr, pos: c.off, strand, votes: c.votes, mapq: 0 });
+            }
+        }
+    }
+
+    // Read-span switch (`--span-switch F,R`): when the runner-up has at least F × the
+    // best's votes, the widest locus (anchors spanning most of the read) among those
+    // with at least F × the best's votes, on both strands, replaces the vote-best if
+    // its span is at least R × the vote-best's. A read diverged from the reference at
+    // its true locus keeps few exact blocks there, so a shorter piece of it that
+    // matches another locus exactly can collect more votes; the true locus still
+    // spans the read. Reported at MAPQ 0 (switched = true).
+    let mut switched = false;
+    if let (Some((f_ppm, r)), Some(b)) = (span, &best) {
+        let min_votes = (f_ppm as u64 * b.votes as u64).div_ceil(1_000_000).max(1) as u32;
+        if second_score >= min_votes {
+            let mut vb_span: Option<u32> = None;
+            let mut widest: Option<(bool, Candidate)> = None;
+            for (anchors, strand) in kept.iter().zip([true, false]) {
+                for c in close_candidates(anchors, min_votes, 8) {
+                    if strand == b.strand && c.chr == b.chr && c.off == b.pos { vb_span = Some(c.q_span); }
+                    let wider = match &widest {
+                        None => true,
+                        Some((_, w)) => (c.q_span, c.votes) > (w.q_span, w.votes),
+                    };
+                    if wider { widest = Some((strand, c)); }
+                }
+            }
+            if let (Some(vs), Some((strand, w))) = (vb_span, widest) {
+                let is_vb = strand == b.strand && w.chr == b.chr && w.off == b.pos;
+                if !is_vb && w.q_span > vs && w.q_span as f64 >= r * vs as f64 {
+                    best = Some(MapResult { chr: w.chr, pos: w.off, strand, votes: w.votes, mapq: 0 });
+                    switched = true;
+                }
+            }
+        }
+    }
+    (best, second_score, switched)
 }
 
-/// Map a single read by diagonal voting on variable-span anchors.
+/// MAPQ of a read whose best locus has `votes` and whose best genuinely different
+/// locus has `second`, or `None` to leave the read unmapped.
 /// MAPQ = (best − second) × 60 / best — the fraction of the best score that is
 /// uncontested. Naturally low when two genomic loci score equally well.
+/// With a near-tie margin (`margin_ppm` > 0, parts per million), a runner-up within
+/// that fraction of the best — an exact tie included — gives MAPQ 0 and the read is
+/// placed. With the margin off, an exact tie is placed at MAPQ 0 if `place_ties`
+/// (`--place-ties`), and left unmapped otherwise.
+pub(crate) fn vote_mapq(votes: u32, second: u32, margin_ppm: u32, place_ties: bool) -> Option<u8> {
+    if margin_ppm > 0
+        && second as u64 * 1_000_000 >= (1_000_000 - margin_ppm.min(1_000_000) as u64) * votes as u64
+    {
+        return Some(0);
+    }
+    if votes > second {
+        Some((votes.saturating_sub(second).saturating_mul(60) / votes.max(1)).min(60) as u8)
+    } else if place_ties {
+        Some(0)
+    } else {
+        None
+    }
+}
+
+/// Map a single read by diagonal voting on variable-span anchors (MAPQ: `vote_mapq`).
 pub(crate) fn map_read(fwd: &[u8], index: &GIndex, k: usize, s: usize, t: usize, mode: SeedMode,
             max_occ: usize, max_occ_l1: usize) -> Option<MapResult> {
     // Both strands' seeds in one pass over the read; no reverse complement is
     // built. Timed as seeding (inside "seeding+LCP+hier"), so "revcomp" reads 0.
     let _ = mode;   // open syncmers are the only seed mode
     let (sf, sr) = timed(&PROF_HIER, || timed(&PROF_SEED, || select_syncmers_both(fwd, k, s, t)));
-    let (mut best, second_score) =
+    let (mut best, second_score, switched) =
         map_read_with_occ(&sf, &sr, index, k, max_occ, max_occ_l1);
     if let Some(ref mut b) = best {
-        if b.votes > second_score {
-            b.mapq = (b.votes.saturating_sub(second_score)
-                .saturating_mul(60) / b.votes.max(1)).min(60) as u8;
+        if switched {
+            b.mapq = 0;
+            return best;
+        }
+        if let Some(q) = vote_mapq(b.votes, second_score, mapq0_margin_ppm(), place_ties()) {
+            b.mapq = q;
             return best;
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::vote_mapq;
+
+    #[test]
+    fn vote_mapq_margin() {
+        // margin off: the vote-margin MAPQ, exact ties unmapped
+        assert_eq!(vote_mapq(100, 0, 0, false), Some(60));
+        assert_eq!(vote_mapq(100, 98, 0, false), Some(1));
+        assert_eq!(vote_mapq(100, 99, 0, false), Some(0));
+        assert_eq!(vote_mapq(100, 100, 0, false), None);
+        // --place-ties without a margin: only exact ties change (MAPQ 0 instead of unmapped)
+        assert_eq!(vote_mapq(100, 100, 0, true), Some(0));
+        assert_eq!(vote_mapq(100, 98, 0, true), Some(1));
+        assert_eq!(vote_mapq(100, 0, 0, true), Some(60));
+        // 5 % margin: runner-up ≥ 95 % of the best → MAPQ 0, exact ties placed
+        let m = 50_000;
+        for t in [false, true] {
+            assert_eq!(vote_mapq(100, 100, m, t), Some(0));
+            assert_eq!(vote_mapq(100, 95, m, t), Some(0));
+            assert_eq!(vote_mapq(100, 94, m, t), Some(3));
+            assert_eq!(vote_mapq(1000, 951, m, t), Some(0));
+            assert_eq!(vote_mapq(1000, 949, m, t), Some(3));
+            assert_eq!(vote_mapq(100, 0, m, t), Some(60));
+        }
+        // no overflow on large vote totals
+        assert_eq!(vote_mapq(u32::MAX, u32::MAX - 1, m, false), Some(0));
+    }
 }
 
 #[derive(Default)]
