@@ -296,6 +296,10 @@ pub(crate) fn run_mapping(reads_path: &str, genome_or_idx: &str, paf_out: Option
         let (idx, ik, is, it, imode) = load_index(genome_or_idx);
         let elapsed = t0.elapsed();
         println!("done  ({:.2}s)", elapsed.as_secs_f64());
+        if let Some((rk, rs)) = requested_ks().filter(|&ks| ks != (ik, is)) {
+            eprintln!("  warning: k={rk} s={rs} was asked for, but the index was built with k={ik} s={is}; \
+                       mapping uses the index's (build it with the same --preset / --k / --s)");
+        }
         (idx, ik, is, it, imode, elapsed)
     } else {
         // In-memory index for direct FASTA mapping: build exactly the levels we
