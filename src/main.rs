@@ -35,12 +35,14 @@ USAGE:
     synpact --map <reads.fq[.gz]> <index.idx|genome.fa[.gz]> -o <out.paf> [options]
 
 PRESETS:
-  --preset fast      --max-level 6 --min-level 3 --place-ties
-  --preset accurate  --max-level 5 --min-level 2 --mapq0-margin 0.05 --span-switch 0.3,1.1
+  --preset fast       --max-level 6 --min-level 3 --place-ties
+  --preset accurate   --max-level 5 --min-level 2 --mapq0-margin 0.05 --span-switch 0.3,1.1
+  --preset optimized  --preset accurate --k 27 --s 24 (syncmer density 1/4): more accurate,
+                   about 2.4× the index and 3× the mapping time of accurate
                    A preset only fills options not given on the command line. Give
                    the same preset to --build-index and --map (it sets the index's
-                   levels). Without a preset synpact runs as before: L6→3, exact
-                   ties unmapped.
+                   levels, and k / s). Without a preset synpact runs as before: L6→3,
+                   exact ties unmapped.
 
 OPTIONS:
   --k N            k-mer length          (default 19, must be ≤ 32)
@@ -94,13 +96,15 @@ fn main() {
     // HiFi always uses open-syncmer seeds with the full k-mer as the LCP atom.
     let mode = SeedMode::Syncmer;
 
-    // --preset fast|accurate: fills the level, tie, margin and switch options the command
-    // line leaves unset (an explicit flag always wins). Set before the flags below, whose
-    // cells are set once; the preset skips every option that has its own flag.
+    // --preset fast|accurate|optimized: fills the k / s, level, tie, margin and switch options
+    // the command line leaves unset (an explicit flag always wins). Set before the flags below,
+    // whose cells are set once; the preset skips every option that has its own flag.
+    let mut preset_ks: Option<(usize, usize)> = None;
     if let Some(p) = args.iter().position(|a| a == "--preset") {
         let name = args.get(p + 1).map(|s| s.as_str()).unwrap_or("");
         let ps = preset_settings(name)
-            .unwrap_or_else(|| panic!("--preset must be fast or accurate, got {name:?}"));
+            .unwrap_or_else(|| panic!("--preset must be fast, accurate or optimized, got {name:?}"));
+        preset_ks = ps.k_s;
         let given = |f: &str| args.iter().any(|a| a == f);
         if !given("--max-level") { set_max_lvl(ps.max_level); }
         if !given("--min-level") { set_min_lvl(ps.min_level); }
@@ -163,10 +167,14 @@ fn main() {
         set_batch_mb(v);
     }
 
-    let k: usize = args.iter().position(|a| a == "--k")
-        .and_then(|p| args.get(p + 1)).and_then(|v| v.parse().ok()).unwrap_or(19);
-    let s: usize = args.iter().position(|a| a == "--s")
-        .and_then(|p| args.get(p + 1)).and_then(|v| v.parse().ok()).unwrap_or(10);
+    // --k / --s, else the preset's (optimized: 27 / 24), else 19 / 10.
+    let flag_k: Option<usize> = args.iter().position(|a| a == "--k")
+        .and_then(|p| args.get(p + 1)).and_then(|v| v.parse().ok());
+    let flag_s: Option<usize> = args.iter().position(|a| a == "--s")
+        .and_then(|p| args.get(p + 1)).and_then(|v| v.parse().ok());
+    let k: usize = flag_k.or(preset_ks.map(|(k, _)| k)).unwrap_or(19);
+    let s: usize = flag_s.or(preset_ks.map(|(_, s)| s)).unwrap_or(10);
+    if flag_k.is_some() || flag_s.is_some() || preset_ks.is_some() { set_requested_ks(k, s); }
     assert!(k > s, "--k ({k}) must be greater than --s ({s})");
     assert!(k <= 32, "--k ({k}) must be ≤ 32 (k-mer atom must fit in u64)");
     let t: usize = (k - s) / 2;  // middle s-mer position

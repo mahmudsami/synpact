@@ -46,17 +46,19 @@ synpact --map reads.fq.gz genome.idx -o out.paf --preset accurate --threads 8
 |--------|---------|-----|
 | `fast` | `--max-level 6 --min-level 3 --place-ties` | coarse levels only: fast, few confident errors; exact ties reported at MAPQ 0 |
 | `accurate` | `--max-level 5 --min-level 2 --mapq0-margin 0.05 --span-switch 0.3,1.1` | one level finer; near-ties reported at MAPQ 0, and a read that a longer locus explains better than the vote-best is placed there |
+| `optimized` | `--preset accurate --k 27 --s 24` | accurate with longer, denser syncmers (k 27, density 1/4): fewest wrong reads; about 2.4× the index (human 3.2 GB) and 3× the mapping time of `accurate` |
 
 A preset only fills options that are not on the command line, so an explicit flag
 overrides it (e.g. `--preset accurate --span-switch 0.3,1.25`). It also sets the
-index's levels, so build the index with the same preset (or the same
-`--max-level` / `--min-level`) you map with. Without a preset synpact runs as before:
+index's levels (and, for `optimized`, k and s), so build the index with the same preset
+(or the same `--max-level` / `--min-level` / `--k` / `--s`) you map with; a prebuilt
+index keeps its own k and s, and mapping warns if they differ from the ones asked for. Without a preset synpact runs as before:
 L6→3, exact ties left unmapped.
 
 ### Options
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--preset NAME` | none | `fast` or `accurate` (see Presets) |
+| `--preset NAME` | none | `fast`, `accurate` or `optimized` (see Presets) |
 | `--k N` | 19 | k-mer (syncmer) length; must be ≤ 32 and > `--s` |
 | `--s N` | 10 | syncmer s-mer length (density ≈ 1/(k−s+1)) |
 | `--threads N` | all cores | worker threads |
@@ -116,7 +118,7 @@ The crate is split into one module per pipeline stage:
 - Placement is locus-only: the output is a position and MAPQ, not a base-level
   alignment. Reads in genuinely ambiguous regions (segmental duplications,
   acrocentric paralogs, tandem-repeat arrays) are reported at low MAPQ; with
-  `--place-ties` (both presets) an exactly tied read is reported at MAPQ 0 rather
+  `--place-ties` (every preset) an exactly tied read is reported at MAPQ 0 rather
   than left unmapped.
 
 

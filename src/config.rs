@@ -75,13 +75,24 @@ pub(crate) fn set_place_ties(on: bool) { let _ = PLACE_TIES_CELL.set(on); }
 
 pub(crate) fn place_ties() -> bool { *PLACE_TIES_CELL.get_or_init(|| false) }
 
+/// The k / s asked for on the command line (`--k`, `--s` or a preset that sets them), if any.
+/// A prebuilt index keeps its own k / s; mapping warns when they differ from this request.
+pub(crate) static REQUESTED_KS_CELL: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+
+pub(crate) fn set_requested_ks(k: usize, s: usize) { let _ = REQUESTED_KS_CELL.set((k, s)); }
+
+pub(crate) fn requested_ks() -> Option<(usize, usize)> { REQUESTED_KS_CELL.get().copied() }
+
 /// The settings of a named preset (`--preset NAME`). A preset only fills the options the
 /// command line leaves unset; an explicit flag always wins.
-///   fast      L6→3, exact ties placed at MAPQ 0: --max-level 6 --min-level 3 --place-ties
-///   accurate  L5→2, near-tie margin 5 % and read-span switch 0.3,1.1:
-///             --max-level 5 --min-level 2 --mapq0-margin 0.05 --span-switch 0.3,1.1
+///   fast       L6→3, exact ties placed at MAPQ 0: --max-level 6 --min-level 3 --place-ties
+///   accurate   L5→2, near-tie margin 5 % and read-span switch 0.3,1.1:
+///              --max-level 5 --min-level 2 --mapq0-margin 0.05 --span-switch 0.3,1.1
+///   optimized  accurate with longer, denser syncmers (k 27, density 1/4):
+///              --preset accurate --k 27 --s 24
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Preset {
+    pub(crate) k_s:          Option<(usize, usize)>,  // None = the defaults (19, 10)
     pub(crate) max_level:    usize,
     pub(crate) min_level:    usize,
     pub(crate) place_ties:   bool,
@@ -91,9 +102,11 @@ pub(crate) struct Preset {
 
 pub(crate) fn preset_settings(name: &str) -> Option<Preset> {
     match name {
-        "fast" => Some(Preset { max_level: 6, min_level: 3, place_ties: true, mapq0_margin: 0.0, span_switch: None }),
-        "accurate" => Some(Preset { max_level: 5, min_level: 2, place_ties: true, mapq0_margin: 0.05,
+        "fast" => Some(Preset { k_s: None, max_level: 6, min_level: 3, place_ties: true, mapq0_margin: 0.0,
+                                span_switch: None }),
+        "accurate" => Some(Preset { k_s: None, max_level: 5, min_level: 2, place_ties: true, mapq0_margin: 0.05,
                                     span_switch: Some((0.3, 1.1)) }),
+        "optimized" => Some(Preset { k_s: Some((27, 24)), ..preset_settings("accurate")? }),
         _ => None,
     }
 }
@@ -108,6 +121,9 @@ mod tests {
         assert_eq!((f.max_level, f.min_level, f.place_ties, f.mapq0_margin, f.span_switch), (6, 3, true, 0.0, None));
         let a = preset_settings("accurate").unwrap();
         assert_eq!((a.max_level, a.min_level, a.mapq0_margin, a.span_switch), (5, 2, 0.05, Some((0.3, 1.1))));
+        assert_eq!((f.k_s, a.k_s), (None, None));
+        let o = preset_settings("optimized").unwrap();
+        assert_eq!(o, Preset { k_s: Some((27, 24)), ..a });
         assert!(preset_settings("default").is_none());
     }
 }
